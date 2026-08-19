@@ -1,0 +1,19 @@
+# Changelog
+
+## [1.0.0] - 2026-08-19
+
+Initial public release.
+
+### Added
+- Always-on kill, loot, and coin tracking - no need to start a session manually, and This Session survives logout/reload
+- Live gold/hour rate based on vendor price or Aux auction data, whichever is higher, shown in both the compact readout and the This Session tab
+- Persistent per-mob loot history in a resizable, movable Loot Tracker window, styled after RuneLite's OSRS Loot Tracker
+- Session and All Time views, with the active view highlighted
+- Collapsible compact mode (time / gold-per-hour / kills-per-hour) for a minimal, non-intrusive footprint
+- Per-mob collapse to hide a mob's loot grid without losing its history
+- Raid-aware loot attribution, including a fallback for delayed loot in groups and raids
+- Unclaimed drops (items other players won) shown greyed out instead of discarded
+- Right-click reset per mob, plus a confirmed Reset All
+- Restart Session to reset the current stretch's clock without touching All Time history
+- Optional pfUI skin integration, auto-detected
+- Minimap button and `/ll` slash command

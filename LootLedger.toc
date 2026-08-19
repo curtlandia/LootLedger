@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: |cffa335eeLootLedger|r
+## Notes: Tracks kills, loot, and coin in real time and reports your gold/hour, with a persistent per-mob loot history.
+## Author: curtlandia
+## Version: 1.0.0
+## OptionalDeps: aux-addon, pfUI
+## SavedVariables: LootLedgerDB, FarmTrackDB
+
+LootLedger.lua

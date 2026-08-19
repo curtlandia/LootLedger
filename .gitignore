@@ -1,0 +1,9 @@
+# Development notes - not meant for public consumption
+PROJECT_CONTEXT.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
