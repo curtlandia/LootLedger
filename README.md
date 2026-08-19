@@ -55,7 +55,13 @@ The source used ("vendor", "AH", or "DE") is shown next to each line.
 
 Loot is credited to whichever mob you killed that matches the corpse you're looting. In a raid, your target usually isn't still the right corpse by the time a delayed loot message arrives, so attribution falls back to whichever tracked mob you killed most recently. This can occasionally misattribute if you kill two different tracked mobs back-to-back before an earlier kill's loot arrives, but it's close enough to be useful in group and raid content, not just solo.
 
-Soul Shards are filtered out entirely - they have no resale value and just clutter the list.
+Group/raid Need or Greed rolls are handled too - only the actual result counts, not the rolling itself:
+
+- If you win the roll, it's credited to you like any other pickup
+- If someone else wins, it shows up greyed out under that mob (visible, but excluded from your total) instead of being discarded
+- The roll process itself (each person's individual roll, "X has selected Greed", etc.) is ignored entirely, so a 5-person roll on one item reads as 1 item dropped, not 5
+
+Soul Shards are filtered out entirely - they have no resale value and just clutter the list. Any item can be filtered the same way by right-clicking its icon in the Loot Tracker window.
 
 ## License
 
