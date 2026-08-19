@@ -812,17 +812,25 @@ local function GetSectionHeader(index)
     highlight:SetBlendMode("ADD")
     highlight:SetAlpha(0.15)
 
-    local nameText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    nameText:SetPoint("LEFT", f, "LEFT", 4, 0)
-    nameText:SetJustifyH("LEFT")
-
-    local killText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    killText:SetPoint("LEFT", nameText, "RIGHT", 6, 0)
-    killText:SetTextColor(ACCENT_R, ACCENT_G, ACCENT_B)
-
     local valueText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     valueText:SetPoint("RIGHT", f, "RIGHT", -4, 0)
     valueText:SetTextColor(1, 0.82, 0)
+
+    local killText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    killText:SetPoint("RIGHT", valueText, "LEFT", -8, 0)
+    killText:SetTextColor(ACCENT_R, ACCENT_G, ACCENT_B)
+
+    -- Anchored on BOTH sides (left edge of the header, right edge pinned
+    -- to killText) rather than just growing rightward from the left like
+    -- killText/valueText do - a long mob name would otherwise push
+    -- straight through them instead of stopping short. Word wrap is off
+    -- so an over-long name clips instead of wrapping onto a second line,
+    -- which HEADER_HEIGHT has no room for.
+    local nameText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    nameText:SetPoint("LEFT", f, "LEFT", 4, 0)
+    nameText:SetPoint("RIGHT", killText, "LEFT", -6, 0)
+    nameText:SetJustifyH("LEFT")
+    nameText:SetWordWrap(false)
 
     f.nameText = nameText
     f.killText = killText
