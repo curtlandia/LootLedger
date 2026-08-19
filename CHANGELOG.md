@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.0] - 2026-08-19
+
+### Added
+- History window (small H button) - every past session logged by Restart Session, most recent first, auto-labeled with the instance you were in or your most-killed mob. Click a session for its full breakdown in chat, delete individual entries, or clear everything
+- Session history is now capped at the most recent 100 entries instead of growing forever
+
 ## [1.1.0] - 2026-08-19
 
 ### Added
@@ -10,6 +16,8 @@
 
 ### Fixed
 - A won group-loot roll ("You won: [Item]") wasn't being credited to the player - it was being treated as someone else's pickup
+- Long mob names could overlap the kill count and value text in the loot window header
+- This Session/All Time highlight could show the wrong one selected when first opening the window
 
 ## [1.0.0] - 2026-08-19
 

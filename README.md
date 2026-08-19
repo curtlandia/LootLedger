@@ -37,6 +37,7 @@ Lists every mob you've tracked a kill for, each with a kill count, total value, 
 - The small **R**/**V** button (top left, next to collapse) toggles mob ordering between most-recently-killed and highest-value
 - Drag the bottom-right corner to resize the window
 - The small **O** button opens **Options** - toggle including disenchant value in pricing, and see/remove everything currently filtered
+- The small **H** button opens **History** - every past session logged by Restart Session, most recent first, each auto-labeled with the instance you were in (if any) or your most-killed mob. Click one for its full breakdown in chat, or delete it with its **x**
 - The small **R** by the close button is **Reset All** - wipes everything, with a confirmation prompt
 - The small **R** next to All Time is **Restart Session** - resets the current stretch's clock without touching All Time history (only shown while viewing This Session)
 - Collapse the whole window (`-` button, top left) to a compact Time / Gold-per-hour / Kills-per-hour readout

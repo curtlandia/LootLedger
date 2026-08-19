@@ -1,5 +1,5 @@
 --[[
-LootLedger v1.1.0
+LootLedger v1.2.0
 
 A gold/hour and loot tracker for vanilla WoW 1.12. Tracking runs
 continuously in the background - kills and loot are valued automatically
@@ -70,6 +70,8 @@ local lootSortMode = "recent" -- "recent" or "value" - which order mob sections 
 local RefreshLootWindow
 local ToggleOptionsWindow -- assigned down in the Options window section
 local RefreshOptionsWindow -- likewise - FilterItem needs to call this if that window happens to already be open
+local ToggleHistoryWindow -- assigned down in the History window section
+local RefreshHistoryWindow -- likewise - DeleteHistoryEntry needs it if that window happens to already be open
 
 -- ---------------------------------------------------------------------
 -- Helpers
@@ -605,6 +607,8 @@ local function PrintLoot()
     end
 end
 
+local MAX_HISTORY_ENTRIES = 100 -- oldest LootLedgerDB.sessions entries drop off past this
+
 local function StopSession()
     if not session then
         Print("No active session.")
@@ -675,6 +679,21 @@ local function StopSession()
     LootLedgerDB = LootLedgerDB or { sessions = {} }
     LootLedgerDB.sessions = LootLedgerDB.sessions or {}
 
+    -- A human-readable label for the History window - the instance name
+    -- takes priority over the most-killed mob when in one (e.g. "Scarlet
+    -- Monastery" beats "Scarlet Monk" even if that particular mob type
+    -- happened to die the most), since that's the more useful "what was
+    -- this session" summary for dungeon farming specifically. Outdoors,
+    -- there's no equivalent single-zone signal that beats "what did I
+    -- actually spend the time killing," so falls back to killRows[1]
+    -- (already sorted descending by count).
+    local sessionLabel = nil
+    if IsInInstance() then
+        sessionLabel = GetRealZoneText()
+    elseif killRows[1] then
+        sessionLabel = killRows[1].name
+    end
+
     local lootLog = {}
     for _, row in ipairs(rows) do
         table.insert(lootLog, { itemID = row.itemID, name = row.name, count = row.count, total = row.total })
@@ -684,6 +703,7 @@ local function StopSession()
         table.insert(killLog, { name = kr.name, level = kr.level, count = kr.count })
     end
     table.insert(LootLedgerDB.sessions, {
+        label = sessionLabel,
         duration = time() - session.startTime,
         kills = session.kills,
         killsByMob = killLog,
@@ -694,6 +714,14 @@ local function StopSession()
         loot = lootLog,
         timestamp = time(),
     })
+    -- Unbounded otherwise - every Restart Session adds one more entry
+    -- forever. Dropping the oldest once past MAX_HISTORY_ENTRIES keeps
+    -- both the SavedVariables file and the History window's list from
+    -- growing without end; recent history is what's actually useful to
+    -- review anyway.
+    while table.getn(LootLedgerDB.sessions) > MAX_HISTORY_ENTRIES do
+        table.remove(LootLedgerDB.sessions, 1)
+    end
 
     -- tracking is continuous - immediately start a fresh session instead
     -- of actually stopping, so Restart Session reads as "show me a
@@ -1144,6 +1172,26 @@ local function CreateLootWindow()
     end)
     UpdateSortButton()
 
+    -- Opens the History window (past logged sessions - see Restart
+    -- Session / StopSession).
+    local historyBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    historyBtn:SetWidth(18)
+    historyBtn:SetHeight(18)
+    historyBtn:SetPoint("LEFT", sortBtn, "RIGHT", 4, 0)
+    historyBtn:SetText("H")
+    historyBtn:SetScript("OnClick", function()
+        ToggleHistoryWindow()
+    end)
+    historyBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("History")
+        GameTooltip:AddLine("Past logged sessions", 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end)
+    historyBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
     -- Forward-declared for the same reason as SetLootWindowMode above -
     -- sessionBtn/allTimeBtn's OnClick (created next) need to call this to
     -- refresh which one looks selected and whether restartBtn applies.
@@ -1370,6 +1418,7 @@ local function CreateLootWindow()
             resetAllBtn:Hide()
             optionsBtn:Hide()
             sortBtn:Hide()
+            historyBtn:Hide()
             restartBtn:Hide()
             summary:Hide()
             summary2:Hide()
@@ -1390,6 +1439,7 @@ local function CreateLootWindow()
             resetAllBtn:Show()
             optionsBtn:Show()
             sortBtn:Show()
+            historyBtn:Show()
             -- Not an unconditional Show() - restartBtn only applies while
             -- viewing "This Session" - UpdateModeButtons() below handles it.
             summary:Show()
@@ -1442,6 +1492,7 @@ local function CreateLootWindow()
             pfUI.api.SkinButton(miniRestartBtn)
             pfUI.api.SkinButton(sortBtn)
             pfUI.api.SkinButton(optionsBtn)
+            pfUI.api.SkinButton(historyBtn)
             if scrollBar then
                 pfUI.api.SkinScrollbar(scrollBar)
             end
@@ -1460,6 +1511,7 @@ local function CreateLootWindow()
             miniRestartBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
             sortBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
             optionsBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
+            historyBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
         end)
         if not ok then
             Print("LootLedger: pfUI skinning failed (" .. tostring(err) .. ") - using default look.")
@@ -1898,6 +1950,280 @@ ToggleOptionsWindow = function()
     else
         RefreshOptionsWindow()
         optionsWindow:Show()
+    end
+end
+
+-- ---------------------------------------------------------------------
+-- History window - past sessions logged by Restart Session (see
+-- StopSession's LootLedgerDB.sessions entry), most recent first.
+-- ---------------------------------------------------------------------
+
+local HISTORY_WIDTH = 320
+local HISTORY_HEIGHT = 360
+local HISTORY_ROW_HEIGHT = 36
+
+local historyWindow
+local historyContent
+local historyRowPool = {}
+
+-- Same shape as StopSession's live chat summary, just reading a saved
+-- entry's already-computed fields instead of recomputing from a live
+-- session - lets you pull up the full item-by-item breakdown of any past
+-- session without it having to still be "This Session".
+local function PrintHistoryEntry(entry)
+    Print("---- Session from " .. date("%m/%d %I:%M%p", entry.timestamp) .. " ----")
+    Print(string.format("Time: %.1f min | Kills: %d | Unique items: %d",
+        entry.duration / 60, entry.kills, table.getn(entry.loot)))
+    for _, kr in ipairs(entry.killsByMob) do
+        if kr.level then
+            Print(string.format("  %dx %s (lvl %d)", kr.count, kr.name, kr.level))
+        else
+            Print(string.format("  %dx %s", kr.count, kr.name))
+        end
+    end
+    if entry.unattributedKills and entry.unattributedKills > 0 then
+        Print(string.format("  %dx (unnamed kill)", entry.unattributedKills))
+    end
+    for _, row in ipairs(entry.loot) do
+        Print(string.format("  %dx %s = %s", row.count, row.name, FormatGold(row.total)))
+    end
+    if entry.moneyLooted and entry.moneyLooted > 0 then
+        Print("Coin looted: " .. FormatGold(entry.moneyLooted))
+    end
+    Print("Total session value: " .. FormatGold(entry.grandTotal))
+    if entry.duration > 0 then
+        Print("Rate: ~" .. FormatGold(entry.grandTotal / (entry.duration / 3600)) .. " / hour")
+    end
+end
+
+local function DeleteHistoryEntry(sessionIndex)
+    if not sessionIndex or not LootLedgerDB or not LootLedgerDB.sessions then return end
+    table.remove(LootLedgerDB.sessions, sessionIndex)
+    if RefreshHistoryWindow then RefreshHistoryWindow() end
+end
+
+local function ClearHistory()
+    if LootLedgerDB then
+        LootLedgerDB.sessions = {}
+    end
+    if RefreshHistoryWindow then RefreshHistoryWindow() end
+end
+
+StaticPopupDialogs["LOOTLEDGER_CLEAR_HISTORY"] = {
+    text = "Clear all logged session history? This cannot be undone.",
+    button1 = "Yes",
+    button2 = "No",
+    OnAccept = function() ClearHistory() end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
+
+local function GetHistoryRow(index)
+    local row = historyRowPool[index]
+    if row then return row end
+
+    row = CreateFrame("Button", nil, historyContent)
+    row:SetHeight(HISTORY_ROW_HEIGHT)
+    row:SetWidth(HISTORY_WIDTH - 40)
+    row:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+    row:SetScript("OnClick", function()
+        if this.entry then PrintHistoryEntry(this.entry) end
+    end)
+    row:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Click for full breakdown in chat")
+        GameTooltip:Show()
+    end)
+    row:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
+    local removeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    removeBtn:SetWidth(16)
+    removeBtn:SetHeight(16)
+    removeBtn:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+    removeBtn:SetText("x")
+    removeBtn:SetScript("OnClick", function()
+        DeleteHistoryEntry(row.sessionIndex)
+    end)
+    removeBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("Delete this entry")
+        GameTooltip:Show()
+    end)
+    removeBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    row.removeBtn = removeBtn
+
+    local labelText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    labelText:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+    labelText:SetPoint("RIGHT", removeBtn, "LEFT", -4, 0)
+    labelText:SetJustifyH("LEFT")
+    row.labelText = labelText
+
+    local detailText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    detailText:SetPoint("TOPLEFT", row, "TOPLEFT", 0, -16)
+    detailText:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+    detailText:SetJustifyH("LEFT")
+    row.detailText = detailText
+
+    historyRowPool[index] = row
+    return row
+end
+
+local function CreateHistoryWindow()
+    if historyWindow then return end
+
+    local f = CreateFrame("Frame", "LootLedgerHistoryWindow", UIParent)
+    tinsert(UISpecialFrames, "LootLedgerHistoryWindow")
+    f:SetWidth(HISTORY_WIDTH)
+    f:SetHeight(HISTORY_HEIGHT)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    f:SetBackdropColor(0, 0, 0, 0.9)
+    f:SetFrameStrata("DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function() this:StartMoving() end)
+    f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    f:Hide()
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", f, "TOP", 0, -10)
+    title:SetText("|cff" .. ACCENT_HEX .. "LootLedger History|r")
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    closeBtn:SetWidth(18)
+    closeBtn:SetHeight(18)
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local clearBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    clearBtn:SetWidth(18)
+    clearBtn:SetHeight(18)
+    clearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
+    clearBtn:SetText("|cffff5555R|r")
+    clearBtn:SetScript("OnClick", function()
+        StaticPopup_Show("LOOTLEDGER_CLEAR_HISTORY")
+    end)
+    clearBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("|cffff5555Clear History|r")
+        GameTooltip:Show()
+    end)
+    clearBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
+    local hintText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    hintText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -34)
+    hintText:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -34)
+    hintText:SetJustifyH("LEFT")
+    hintText:SetText("Click a session for its full breakdown in chat.")
+    hintText:SetTextColor(0.6, 0.6, 0.6)
+
+    local emptyText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    emptyText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -54)
+    emptyText:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -54)
+    emptyText:SetJustifyH("LEFT")
+    emptyText:SetText("No sessions logged yet - use Restart Session to log one.")
+    emptyText:SetTextColor(0.6, 0.6, 0.6)
+    f.emptyText = emptyText
+
+    local scroll = CreateFrame("ScrollFrame", "LootLedgerHistoryScrollFrame", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -54)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 14)
+
+    local scrollBar = _G["LootLedgerHistoryScrollFrameScrollBar"]
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetWidth(HISTORY_WIDTH - 40)
+    content:SetHeight(1)
+    scroll:SetScrollChild(content)
+    historyContent = content
+
+    if pfUI and pfUI.api then
+        pcall(function()
+            pfUI.api.CreateBackdrop(f)
+            pfUI.api.CreateBackdropShadow(f)
+            pfUI.api.SkinCloseButton(closeBtn)
+            pfUI.api.SkinButton(clearBtn)
+            clearBtn:SetBackdropBorderColor(1, 0.15, 0.15, 1)
+            if scrollBar then
+                pfUI.api.SkinScrollbar(scrollBar)
+            end
+        end)
+    end
+
+    historyWindow = f
+end
+
+RefreshHistoryWindow = function()
+    if not historyWindow then return end
+
+    local sessions = (LootLedgerDB and LootLedgerDB.sessions) or {}
+    local total = table.getn(sessions)
+
+    if total == 0 then
+        historyWindow.emptyText:Show()
+    else
+        historyWindow.emptyText:Hide()
+    end
+
+    local yOffset = 0
+    local used = 0
+    local i
+    for i = total, 1, -1 do
+        used = used + 1
+        local entry = sessions[i]
+        local row = GetHistoryRow(used)
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", historyContent, "TOPLEFT", 0, -yOffset)
+        row.entry = entry
+        row.sessionIndex = i
+
+        local label = entry.label or "Session"
+        row.labelText:SetText(string.format("|cffffd700%s|r - %s", label, date("%m/%d %I:%M%p", entry.timestamp)))
+
+        local hours = math.floor(entry.duration / 3600)
+        local mins = math.floor((entry.duration - hours * 3600) / 60)
+        local durationText = hours > 0 and string.format("%dh %dm", hours, mins) or string.format("%dm", mins)
+
+        local gph = 0
+        if entry.duration > 0 then
+            gph = entry.grandTotal / (entry.duration / 3600)
+        end
+        row.detailText:SetText(string.format("%s | %d kills | |cffffd700%s|r | %s/hr",
+            durationText, entry.kills, FormatGold(entry.grandTotal), FormatGoldShort(gph)))
+
+        row:Show()
+        yOffset = yOffset + HISTORY_ROW_HEIGHT
+    end
+
+    local j = used + 1
+    while historyRowPool[j] do
+        historyRowPool[j]:Hide()
+        j = j + 1
+    end
+
+    historyContent:SetHeight(yOffset > 0 and yOffset or 1)
+end
+
+ToggleHistoryWindow = function()
+    CreateHistoryWindow()
+    if historyWindow:IsShown() then
+        historyWindow:Hide()
+    else
+        RefreshHistoryWindow()
+        historyWindow:Show()
     end
 end
 
@@ -2447,4 +2773,4 @@ logoutFrame:SetScript("OnEvent", function()
     LootLedgerDB.currentSession = session
 end)
 
-Print("Loaded v1.1.0. Always tracking - /ll for the loot tracker.")
+Print("Loaded v1.2.0. Always tracking - /ll for the loot tracker.")
