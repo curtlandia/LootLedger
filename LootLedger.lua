@@ -833,7 +833,6 @@ local function GetSectionHeader(index)
     nameText:SetPoint("RIGHT", killText, "LEFT", -6, 0)
     nameText:SetHeight(HEADER_HEIGHT)
     nameText:SetJustifyH("LEFT")
-    nameText:SetWordWrap(false)
 
     f.nameText = nameText
     f.killText = killText
