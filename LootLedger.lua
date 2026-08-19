@@ -823,12 +823,15 @@ local function GetSectionHeader(index)
     -- Anchored on BOTH sides (left edge of the header, right edge pinned
     -- to killText) rather than just growing rightward from the left like
     -- killText/valueText do - a long mob name would otherwise push
-    -- straight through them instead of stopping short. Word wrap is off
-    -- so an over-long name clips instead of wrapping onto a second line,
-    -- which HEADER_HEIGHT has no room for.
+    -- straight through them instead of stopping short. SetWordWrap isn't
+    -- available on this client's FontString objects (errors as a nil
+    -- method), so an over-long name wraps to a second line instead of
+    -- clipping - the fixed SetHeight below at least keeps that second
+    -- line from spilling down into the icon grid.
     local nameText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     nameText:SetPoint("LEFT", f, "LEFT", 4, 0)
     nameText:SetPoint("RIGHT", killText, "LEFT", -6, 0)
+    nameText:SetHeight(HEADER_HEIGHT)
     nameText:SetJustifyH("LEFT")
     nameText:SetWordWrap(false)
 
