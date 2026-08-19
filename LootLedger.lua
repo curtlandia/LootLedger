@@ -1466,6 +1466,17 @@ local function CreateLootWindow()
         end
     end
 
+    -- Re-applied after pfUI skinning (not just once, back when the
+    -- buttons were created) - pfUI.api.SkinButton replaces LockHighlight/
+    -- UnlockHighlight with its own border-recoloring versions, and the
+    -- SetBackdropBorderColor calls just above force both buttons to the
+    -- same accent color regardless of which one is actually active. The
+    -- first UpdateModeButtons() call locked in the pre-skin visual, which
+    -- pfUI's skin pass then overwrote without anything re-asserting it
+    -- afterward - default view opened with This Session looking
+    -- highlighted even when All Time was actually selected.
+    UpdateModeButtons()
+
     lootWindow = f
     lootScrollFrame = scroll
     lootContent = content
