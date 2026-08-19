@@ -17,3 +17,6 @@ Initial public release.
 - Restart Session to reset the current stretch's clock without touching All Time history
 - Optional pfUI skin integration, auto-detected
 - Minimap button and `/ll` slash command
+
+### Fixed
+- Item icon quality borders now read clearly instead of blending into the background

@@ -822,18 +822,29 @@ local function GetIconButton(index)
     b:SetWidth(ICON_SIZE)
     b:SetHeight(ICON_SIZE)
 
-    -- Item-slot-style border, like a real WoW bag/bank slot, colored per
-    -- item quality on each refresh (see RefreshLootWindow) - not a WHITE8X8
-    -- tint this time, since real bag slots use this exact texture/coords
-    -- and it reads as more "item slot," less "generic panel."
+    -- Border lives on the button's own backdrop rather than a separate
+    -- overlapping frame - a second frame layered above via SetFrameLevel
+    -- turned out unreliable across a whole grid of icons (borders would
+    -- randomly go missing on some slots, presumably losing the level
+    -- race against a neighboring icon's own frame). A single frame's own
+    -- draw layers (BACKGROUND for the backdrop, ARTWORK for the icon) are
+    -- strictly ordered with no such ambiguity.
     b:SetBackdrop({
         edgeFile = "Interface\\Buttons\\WHITE8X8",
         edgeSize = 1,
     })
     b:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+    b.border = b
 
+    -- Inset 1px so the backdrop border (BACKGROUND layer, below the icon)
+    -- isn't fully covered by an icon the same size as the button - and
+    -- cropped to cut off the faint ~8% empty bezel baked into every
+    -- Blizzard icon texture, which otherwise reads as a second, duller
+    -- border sitting just inside the real colored one.
     local icon = b:CreateTexture(nil, "ARTWORK")
-    icon:SetAllPoints(b)
+    icon:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
+    icon:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     b.icon = icon
 
     -- Same highlight texture real bag/bank item slots use on hover.
@@ -1433,7 +1444,7 @@ RefreshLootWindow = function()
                 btn.itemID = nil
                 btn.moneyTotal = ir.total
                 btn.unclaimed = false
-                btn:SetBackdropBorderColor(1, 0.82, 0, 1)
+                btn.border:SetBackdropBorderColor(1, 0.82, 0, 1)
             else
                 -- Same shifted-fields destructuring as GetBestPrice - see
                 -- its comment for why.
@@ -1451,9 +1462,9 @@ RefreshLootWindow = function()
                 btn.unclaimed = ir.unclaimed or false
                 if quality and quality >= 0 then
                     local r, g, b = GetItemQualityColor(quality)
-                    btn:SetBackdropBorderColor(r, g, b, 1)
+                    btn.border:SetBackdropBorderColor(r, g, b, 1)
                 else
-                    btn:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+                    btn.border:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
                 end
                 -- Someone else's pickup - shown but visually muted, and
                 -- excluded from value (total was baked in as 0 above).
