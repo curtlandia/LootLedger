@@ -33,7 +33,10 @@ Lists every mob you've tracked a kill for, each with a kill count, total value, 
 - Coin looted shows up in the grid as its own entry, sorted by value like any other drop
 - Items you didn't personally win still appear, greyed out, excluded from the total
 - Click a mob's header to collapse or expand just that mob's loot grid; right-click it to reset just that mob
+- Right-click an item icon to filter it out entirely - it stops being tracked and disappears from existing history too
+- The small **R**/**V** button (top left, next to collapse) toggles mob ordering between most-recently-killed and highest-value
 - Drag the bottom-right corner to resize the window
+- The small **O** button opens **Options** - toggle including disenchant value in pricing, and see/remove everything currently filtered
 - The small **R** by the close button is **Reset All** - wipes everything, with a confirmation prompt
 - The small **R** next to All Time is **Restart Session** - resets the current stretch's clock without touching All Time history (only shown while viewing This Session)
 - Collapse the whole window (`-` button, top left) to a compact Time / Gold-per-hour / Kills-per-hour readout
@@ -44,8 +47,9 @@ Each item is valued at whichever is higher:
 
 1. **Vendor sell price**, read directly from the client
 2. **Aux's market value** - the same weighted-median calculation Aux itself uses (recent scans weighted higher, decaying over time), not just the latest scan or a flat average
+3. **Expected disenchant value** (optional, off by default - enable in Options) - Aux's own real vanilla disenchant-yield data and pricing, not a guess
 
-The source used ("vendor" or "AH") is shown next to each line.
+The source used ("vendor", "AH", or "DE") is shown next to each line.
 
 ## Loot attribution
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0] - 2026-08-19
+
+### Added
+- Toggle mob ordering between most-recently-killed and highest-value (small R/V button)
+- Right-click an item icon to filter it out entirely - stops future tracking and hides it from existing history
+- Options window (small O button) listing everything currently filtered, with one-click removal
+- Optional disenchant value in pricing (off by default) - uses Aux's own real vanilla disenchant-yield data, counted only when higher than vendor/AH
+
+### Fixed
+- A won group-loot roll ("You won: [Item]") wasn't being credited to the player - it was being treated as someone else's pickup
+
 ## [1.0.0] - 2026-08-19
 
 Initial public release.

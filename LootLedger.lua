@@ -1,5 +1,5 @@
 --[[
-LootLedger v1.0.0
+LootLedger v1.1.0
 
 A gold/hour and loot tracker for vanilla WoW 1.12. Tracking runs
 continuously in the background - kills and loot are valued automatically
@@ -66,7 +66,10 @@ local lootSummaryText2
 local lootModeButtons = {}
 local lootViewMode = "alltime" -- "alltime" or "session"
 local lootWindowCompact = false -- true = shrunk to just Time/Gold/hr/Kills/hr
+local lootSortMode = "recent" -- "recent" or "value" - which order mob sections list in
 local RefreshLootWindow
+local ToggleOptionsWindow -- assigned down in the Options window section
+local RefreshOptionsWindow -- likewise - FilterItem needs to call this if that window happens to already be open
 
 -- ---------------------------------------------------------------------
 -- Helpers
@@ -85,7 +88,14 @@ local EXCLUDED_ITEM_NAMES = {
     ["Soul Shard"] = true,
 }
 
+-- User-added items (right-click an item icon -> Filter This Item),
+-- persisted so they stay filtered across sessions. Same treatment as
+-- EXCLUDED_ITEM_NAMES above - never recorded going forward, and hidden
+-- retroactively from existing history at render time.
 local function IsExcludedItem(itemID)
+    if LootLedgerDB and LootLedgerDB.filteredItems and LootLedgerDB.filteredItems[itemID] then
+        return true
+    end
     local name = GetItemInfo(itemID)
     return name and EXCLUDED_ITEM_NAMES[name]
 end
@@ -209,8 +219,38 @@ local function ParseMoneyFromText(text)
     return copper
 end
 
--- Returns the best known price (copper) for an item: max(vendor sell, Aux AH).
--- Also returns which source was used, for display purposes.
+-- Expected disenchant value, using Aux's own real vanilla DE-yield data
+-- and pricing (aux-addon/core/disenchant.lua) rather than a hand-built
+-- table here - Aux already gets this right for its own tooltip's
+-- "Disenchant: X" line, so this reuses the exact same calculation
+-- instead of re-deriving it. `require`/`module` are plain globals Aux's
+-- own package.lua defines (see libs/package.lua) - any addon loaded
+-- after Aux can call them the same way Aux's own files do internally.
+-- Only meaningful for armor/weapons above a certain quality, so nil
+-- (not zero) for anything else - handled the same as "no price data"
+-- by GetBestPrice below.
+local function GetDisenchantValue(itemID)
+    if not require then return nil end
+    local ok, mod = pcall(require, "aux.core.disenchant")
+    if not ok or not mod or not mod.value then return nil end
+    -- Mirrors aux-addon's own util/info.lua item() destructure exactly
+    -- (name, itemstring, quality, level, class, subclass, max_stack,
+    -- slot, texture) - disenchant.value's level/slot arguments need to
+    -- line up with however this client's GetItemInfo actually orders its
+    -- return values, and Aux's own code is the proven-correct reference
+    -- for that, rather than reusing GetBestPrice's own destructuring
+    -- below (worked out for a different field - sellPrice - and not
+    -- guaranteed to line up the same way for these ones).
+    local name, itemstring, quality, level, class, subclass, max_stack, slot, texture = GetItemInfo(itemID)
+    if not name then return nil end
+    local ok2, value = pcall(mod.value, slot, quality, level, itemID)
+    if not ok2 then return nil end
+    return value
+end
+
+-- Returns the best known price (copper) for an item: max(vendor sell, Aux
+-- AH, and - if enabled in Options - expected disenchant value). Also
+-- returns which source was used, for display purposes.
 --
 -- GetItemInfo on this client returns 10 values, not vanilla's standard 11
 -- - it never returns minLevel, so every field from there onward is
@@ -223,13 +263,21 @@ local function GetBestPrice(itemID)
     sellPrice = sellPrice or 0
     auxPrice = auxPrice or 0
 
-    if auxPrice > sellPrice then
-        return auxPrice, "AH"
-    elseif sellPrice > 0 then
-        return sellPrice, "vendor"
-    else
-        return nil, "unknown"
+    local best, source = 0, "unknown"
+    if sellPrice > best then best, source = sellPrice, "vendor" end
+    if auxPrice > best then best, source = auxPrice, "AH" end
+
+    if LootLedgerDB and LootLedgerDB.useDisenchantValue then
+        local deValue = GetDisenchantValue(itemID)
+        if deValue and deValue > best then
+            best, source = deValue, "DE"
+        end
     end
+
+    if best > 0 then
+        return best, source
+    end
+    return nil, "unknown"
 end
 
 -- ---------------------------------------------------------------------
@@ -814,6 +862,50 @@ local function GetSectionHeader(index)
     return f
 end
 
+-- Right-clicking an item icon opens this - same "menu instead of instant
+-- action" pattern as the mob reset menu above, for the same reason (no
+-- accidental filtering from a stray right-click). Filtering hides the
+-- item everywhere (see IsExcludedItem) and stops it from being recorded
+-- going forward; removing it again is done from the Options window,
+-- which lists everything currently filtered.
+local itemFilterMenuTarget = nil -- itemID
+local itemFilterMenuFrame = nil
+
+local function FilterItem(itemID)
+    if not itemID then return end
+    LootLedgerDB = LootLedgerDB or { sessions = {} }
+    LootLedgerDB.filteredItems = LootLedgerDB.filteredItems or {}
+    LootLedgerDB.filteredItems[itemID] = true
+    MaybeRefreshLootWindow()
+    if RefreshOptionsWindow then RefreshOptionsWindow() end
+end
+
+local function InitItemFilterMenu()
+    local itemName = itemFilterMenuTarget and (GetItemInfo(itemFilterMenuTarget) or ("item " .. itemFilterMenuTarget))
+    local info = UIDropDownMenu_CreateInfo()
+    info.text = itemName or ""
+    info.isTitle = true
+    info.notCheckable = true
+    UIDropDownMenu_AddButton(info)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "Filter This Item"
+    info.notCheckable = true
+    info.func = function()
+        FilterItem(itemFilterMenuTarget)
+    end
+    UIDropDownMenu_AddButton(info)
+end
+
+local function ShowItemFilterMenu(itemID)
+    itemFilterMenuTarget = itemID
+    if not itemFilterMenuFrame then
+        itemFilterMenuFrame = CreateFrame("Frame", "LootLedgerItemFilterMenu", UIParent, "UIDropDownMenuTemplate")
+    end
+    UIDropDownMenu_Initialize(itemFilterMenuFrame, InitItemFilterMenu, "MENU")
+    ToggleDropDownMenu(1, nil, itemFilterMenuFrame, "cursor", 0, 0)
+end
+
 local function GetIconButton(index)
     local b = iconButtonPool[index]
     if b then return b end
@@ -868,7 +960,15 @@ local function GetIconButton(index)
             if this.unclaimed then
                 GameTooltip:AddLine("Looted by someone else - not counted", 0.7, 0.7, 0.7)
             end
+            GameTooltip:AddLine("Right-click to filter this item", 0.7, 0.7, 0.7)
             GameTooltip:Show()
+        end
+    end)
+    -- Right-click opens a small menu to filter this item out entirely
+    -- (see FilterItem) - not the coin slot, which has no itemID.
+    b:SetScript("OnMouseUp", function()
+        if arg1 == "RightButton" and this.itemID then
+            ShowItemFilterMenu(this.itemID)
         end
     end)
     b:SetScript("OnLeave", function()
@@ -951,6 +1051,27 @@ local function CreateLootWindow()
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     closeBtn:SetScript("OnClick", function() lootWindow:Hide() end)
 
+    -- Opens the Options window (filtered items, disenchant-value toggle).
+    -- Tucked next to Reset All/close for the same reason those are tiny -
+    -- infrequent enough not to deserve a full row.
+    local optionsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    optionsBtn:SetWidth(18)
+    optionsBtn:SetHeight(18)
+    optionsBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
+    optionsBtn:SetText("O")
+    optionsBtn:SetScript("OnClick", function()
+        ToggleOptionsWindow()
+    end)
+    optionsBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("Options")
+        GameTooltip:AddLine("Filtered items, disenchant value", 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end)
+    optionsBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
     -- Wipes ALL loot history (both views). Tiny + red-bordered, tucked up
     -- next to the close button rather than taking a full row - it's rare
     -- enough to need that it doesn't deserve prime real estate, and the
@@ -958,7 +1079,7 @@ local function CreateLootWindow()
     local resetAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     resetAllBtn:SetWidth(18)
     resetAllBtn:SetHeight(18)
-    resetAllBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
+    resetAllBtn:SetPoint("RIGHT", optionsBtn, "LEFT", -2, 0)
     resetAllBtn:SetText("|cffff5555R|r")
     resetAllBtn:SetScript("OnClick", function()
         StaticPopup_Show("LOOTLEDGER_RESET_ALL")
@@ -987,6 +1108,31 @@ local function CreateLootWindow()
     collapseBtn:SetScript("OnClick", function()
         SetLootWindowMode(not lootWindowCompact)
     end)
+
+    -- Toggles mob section ordering between most-recently-killed and
+    -- highest-value (see the sort in RefreshLootWindow).
+    local sortBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    sortBtn:SetWidth(18)
+    sortBtn:SetHeight(18)
+    sortBtn:SetPoint("LEFT", collapseBtn, "RIGHT", 4, 0)
+    local function UpdateSortButton()
+        sortBtn:SetText(lootSortMode == "value" and "V" or "R")
+    end
+    sortBtn:SetScript("OnClick", function()
+        lootSortMode = (lootSortMode == "value") and "recent" or "value"
+        UpdateSortButton()
+        RefreshLootWindow()
+    end)
+    sortBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText(lootSortMode == "value" and "Sorted by Value" or "Sorted by Most Recent")
+        GameTooltip:AddLine("Click to change", 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end)
+    sortBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    UpdateSortButton()
 
     -- Forward-declared for the same reason as SetLootWindowMode above -
     -- sessionBtn/allTimeBtn's OnClick (created next) need to call this to
@@ -1212,6 +1358,8 @@ local function CreateLootWindow()
             sessionBtn:Hide()
             allTimeBtn:Hide()
             resetAllBtn:Hide()
+            optionsBtn:Hide()
+            sortBtn:Hide()
             restartBtn:Hide()
             summary:Hide()
             summary2:Hide()
@@ -1230,6 +1378,8 @@ local function CreateLootWindow()
             sessionBtn:Show()
             allTimeBtn:Show()
             resetAllBtn:Show()
+            optionsBtn:Show()
+            sortBtn:Show()
             -- Not an unconditional Show() - restartBtn only applies while
             -- viewing "This Session" - UpdateModeButtons() below handles it.
             summary:Show()
@@ -1280,6 +1430,8 @@ local function CreateLootWindow()
             pfUI.api.SkinButton(restartBtn)
             pfUI.api.SkinButton(collapseBtn)
             pfUI.api.SkinButton(miniRestartBtn)
+            pfUI.api.SkinButton(sortBtn)
+            pfUI.api.SkinButton(optionsBtn)
             if scrollBar then
                 pfUI.api.SkinScrollbar(scrollBar)
             end
@@ -1296,6 +1448,8 @@ local function CreateLootWindow()
             resetAllBtn:SetBackdropBorderColor(1, 0.15, 0.15, 1)
             collapseBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
             miniRestartBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
+            sortBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
+            optionsBtn:SetBackdropBorderColor(ACCENT_R, ACCENT_G, ACCENT_B, 1)
         end)
         if not ok then
             Print("LootLedger: pfUI skinning failed (" .. tostring(err) .. ") - using default look.")
@@ -1368,13 +1522,16 @@ RefreshLootWindow = function()
             lastUpdate = rec.lastUpdate or 0,
         })
     end
-    -- Sorted by most recent activity, not value - value sorting reads as
-    -- an arbitrary tie order once several mobs share 0g (no price data on
-    -- record for their drops), and "what did I just kill" is more useful
-    -- to see at a glance while actively farming anyway. Records saved
-    -- before this field existed default to 0 (oldest) via the fallback
-    -- above, rather than erroring on a missing field.
-    table.sort(mobRows, function(a, b) return a.lastUpdate > b.lastUpdate end)
+    -- Sort mode toggled via the R/V button in the header. "recent" reads
+    -- as "what did I just kill", useful at a glance while actively
+    -- farming; "value" surfaces the mobs actually worth the trip. Records
+    -- saved before lastUpdate existed default to 0 (oldest) via the
+    -- fallback above, rather than erroring on a missing field.
+    if lootSortMode == "value" then
+        table.sort(mobRows, function(a, b) return a.value > b.value end)
+    else
+        table.sort(mobRows, function(a, b) return a.lastUpdate > b.lastUpdate end)
+    end
 
     local totalKills, totalValue = 0, 0
     for _, mr in ipairs(mobRows) do
@@ -1512,6 +1669,214 @@ local function ToggleLootWindow()
     else
         RefreshLootWindow()
         lootWindow:Show()
+    end
+end
+
+-- ---------------------------------------------------------------------
+-- Options window - the disenchant-value toggle (see GetDisenchantValue/
+-- GetBestPrice), and the list of items filtered out via right-click on
+-- an item icon (see FilterItem).
+-- ---------------------------------------------------------------------
+
+local OPTIONS_WIDTH = 260
+local OPTIONS_HEIGHT = 320
+local OPTIONS_ROW_HEIGHT = 22
+
+local optionsWindow
+local optionsContent
+local optionsRowPool = {}
+local deCheckbox
+
+local function UnfilterItem(itemID)
+    if not itemID or not LootLedgerDB or not LootLedgerDB.filteredItems then return end
+    LootLedgerDB.filteredItems[itemID] = nil
+    MaybeRefreshLootWindow()
+    if RefreshOptionsWindow then RefreshOptionsWindow() end
+end
+
+local function GetOptionsRow(index)
+    local row = optionsRowPool[index]
+    if row then return row end
+
+    row = CreateFrame("Frame", nil, optionsContent)
+    row:SetHeight(OPTIONS_ROW_HEIGHT)
+    row:SetWidth(OPTIONS_WIDTH - 40)
+
+    local icon = row:CreateTexture(nil, "ARTWORK")
+    icon:SetWidth(18)
+    icon:SetHeight(18)
+    icon:SetPoint("LEFT", row, "LEFT", 0, 0)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    row.icon = icon
+
+    local removeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    removeBtn:SetWidth(16)
+    removeBtn:SetHeight(16)
+    removeBtn:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+    removeBtn:SetText("x")
+    removeBtn:SetScript("OnClick", function()
+        UnfilterItem(this.itemID)
+    end)
+    removeBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("Remove from filter")
+        GameTooltip:Show()
+    end)
+    removeBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    row.removeBtn = removeBtn
+
+    local nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    nameText:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+    nameText:SetPoint("RIGHT", removeBtn, "LEFT", -4, 0)
+    nameText:SetJustifyH("LEFT")
+    row.nameText = nameText
+
+    optionsRowPool[index] = row
+    return row
+end
+
+local function CreateOptionsWindow()
+    if optionsWindow then return end
+
+    local f = CreateFrame("Frame", "LootLedgerOptionsWindow", UIParent)
+    tinsert(UISpecialFrames, "LootLedgerOptionsWindow")
+    f:SetWidth(OPTIONS_WIDTH)
+    f:SetHeight(OPTIONS_HEIGHT)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    f:SetBackdropColor(0, 0, 0, 0.9)
+    f:SetFrameStrata("DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function() this:StartMoving() end)
+    f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    f:Hide()
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", f, "TOP", 0, -10)
+    title:SetText("|cff" .. ACCENT_HEX .. "LootLedger Options|r")
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    closeBtn:SetWidth(18)
+    closeBtn:SetHeight(18)
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    deCheckbox = CreateFrame("CheckButton", "LootLedgerDECheckbox", f, "UICheckButtonTemplate")
+    deCheckbox:SetWidth(20)
+    deCheckbox:SetHeight(20)
+    deCheckbox:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -36)
+    deCheckbox:SetScript("OnClick", function()
+        LootLedgerDB = LootLedgerDB or { sessions = {} }
+        LootLedgerDB.useDisenchantValue = (this:GetChecked() == 1)
+        MaybeRefreshLootWindow()
+    end)
+    local deLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    deLabel:SetPoint("LEFT", deCheckbox, "RIGHT", 2, 1)
+    deLabel:SetPoint("RIGHT", f, "RIGHT", -14, 0)
+    deLabel:SetJustifyH("LEFT")
+    deLabel:SetText("Include disenchant value (if higher than vendor/AH)")
+
+    local filterLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    filterLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -66)
+    filterLabel:SetText("|cffffd700Filtered Items|r")
+
+    local emptyText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    emptyText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -86)
+    emptyText:SetPoint("TOPRIGHT", f, "TOPRIGHT", -14, -86)
+    emptyText:SetJustifyH("LEFT")
+    emptyText:SetText("Right-click an item icon in the Loot Tracker to filter it out.")
+    emptyText:SetTextColor(0.6, 0.6, 0.6)
+    f.emptyText = emptyText
+
+    local scroll = CreateFrame("ScrollFrame", "LootLedgerOptionsScrollFrame", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -86)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 14)
+
+    local scrollBar = _G["LootLedgerOptionsScrollFrameScrollBar"]
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetWidth(OPTIONS_WIDTH - 40)
+    content:SetHeight(1)
+    scroll:SetScrollChild(content)
+    optionsContent = content
+
+    if pfUI and pfUI.api then
+        pcall(function()
+            pfUI.api.CreateBackdrop(f)
+            pfUI.api.CreateBackdropShadow(f)
+            pfUI.api.SkinCloseButton(closeBtn)
+            pfUI.api.SkinCheckbox(deCheckbox)
+            if scrollBar then
+                pfUI.api.SkinScrollbar(scrollBar)
+            end
+        end)
+    end
+
+    optionsWindow = f
+end
+
+RefreshOptionsWindow = function()
+    if not optionsWindow then return end
+
+    deCheckbox:SetChecked(LootLedgerDB and LootLedgerDB.useDisenchantValue)
+
+    local filtered = (LootLedgerDB and LootLedgerDB.filteredItems) or {}
+    local itemIDs = {}
+    for itemID in pairs(filtered) do
+        table.insert(itemIDs, itemID)
+    end
+    table.sort(itemIDs, function(a, b) return a < b end)
+
+    if table.getn(itemIDs) == 0 then
+        optionsWindow.emptyText:Show()
+    else
+        optionsWindow.emptyText:Hide()
+    end
+
+    local yOffset = 0
+    local used = 0
+    for _, itemID in ipairs(itemIDs) do
+        used = used + 1
+        local row = GetOptionsRow(used)
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", optionsContent, "TOPLEFT", 0, -yOffset)
+        local name, link, quality, ilvl, itype, isub, stack, equip, texture = GetItemInfo(itemID)
+        row.nameText:SetText(name or ("item " .. itemID))
+        if texture and texture ~= "" and type(texture) ~= "number" then
+            row.icon:SetTexture(texture)
+        else
+            row.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+        end
+        row.removeBtn.itemID = itemID
+        row:Show()
+        yOffset = yOffset + OPTIONS_ROW_HEIGHT
+    end
+
+    local i = used + 1
+    while optionsRowPool[i] do
+        optionsRowPool[i]:Hide()
+        i = i + 1
+    end
+
+    optionsContent:SetHeight(yOffset > 0 and yOffset or 1)
+end
+
+ToggleOptionsWindow = function()
+    CreateOptionsWindow()
+    if optionsWindow:IsShown() then
+        optionsWindow:Hide()
+    else
+        RefreshOptionsWindow()
+        optionsWindow:Show()
     end
 end
 
@@ -1666,9 +2031,14 @@ frame:SetScript("OnEvent", function()
         -- "You have selected Greed for: [Item]" roll-participation line
         -- as if they'd actually received it. Requiring the exact
         -- "receive(s) loot:" phrasing (or " won: " for the winner
-        -- announcement) instead of just a "You" prefix filters all of
-        -- that process noise out, leaving only genuine pickups.
-        local isOwnPickup = string.find(arg1, "^You receive loot:") ~= nil
+        -- announcement) instead of just a "You" prefix filters that
+        -- process noise out, leaving only genuine pickups.
+        --
+        -- A won roll never generates a separate "You receive loot:" line
+        -- on this server - "You won: [Item]." is the only notification,
+        -- so it has to count as an own pickup too, not just anyone else's
+        -- win ("PlayerName won: [Item].", still only matched below).
+        local isOwnPickup = (string.find(arg1, "^You receive loot:") or string.find(arg1, "^You won:")) ~= nil
         local isOtherPickup = (not isOwnPickup)
             and (string.find(arg1, "receives loot:") or string.find(arg1, " won: "))
 
@@ -2056,4 +2426,4 @@ logoutFrame:SetScript("OnEvent", function()
     LootLedgerDB.currentSession = session
 end)
 
-Print("Loaded v1.0.0. Always tracking - /ll for the loot tracker.")
+Print("Loaded v1.1.0. Always tracking - /ll for the loot tracker.")
