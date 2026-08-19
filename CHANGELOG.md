@@ -20,3 +20,4 @@ Initial public release.
 
 ### Fixed
 - Item icon quality borders now read clearly instead of blending into the background
+- Group loot roll announcements (Greed/Need roll lines, winner announcements) were being miscounted as separate item drops, wildly inflating drop counts and occasionally crediting items to the wrong person - only genuine loot receipts are counted now

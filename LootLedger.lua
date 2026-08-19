@@ -1655,12 +1655,24 @@ frame:SetScript("OnEvent", function()
         -- "You receive loot: |cffffffff|Hitem:6522:0:0:0:0:0:0:0|h[Deviate Fish]|h|rx2."
         -- In a group/raid, CHAT_MSG_LOOT also carries other players'
         -- pickups as third-person broadcasts - "PlayerName receives loot:
-        -- [Item]." Only messages starting with "You" are the player's own
-        -- pickup; anything else is skipped before it ever touches
-        -- session.loot or per-mob attribution. This also means if 2 of an
-        -- item drop and the player only wins 1, the count correctly ends
-        -- up as 1, not 2.
-        if string.find(arg1, "^You ") then
+        -- [Item]." - and on this server, roll results too: a "Greed Roll -
+        -- N for [Item] by Name" line per person who rolled, then a
+        -- "Name won: [Item]" line for the winner, all as their own
+        -- CHAT_MSG_LOOT events, none of which are an actual loot receipt.
+        -- A loose "starts with You" / "contains an item link" check
+        -- can't tell those apart from the real thing - it counted every
+        -- single roll line as its own drop (a 5-person roll on one item
+        -- read as "5 of that item dropped"), and counted the player's own
+        -- "You have selected Greed for: [Item]" roll-participation line
+        -- as if they'd actually received it. Requiring the exact
+        -- "receive(s) loot:" phrasing (or " won: " for the winner
+        -- announcement) instead of just a "You" prefix filters all of
+        -- that process noise out, leaving only genuine pickups.
+        local isOwnPickup = string.find(arg1, "^You receive loot:") ~= nil
+        local isOtherPickup = (not isOwnPickup)
+            and (string.find(arg1, "receives loot:") or string.find(arg1, " won: "))
+
+        if isOwnPickup then
             local _, _, itemID = string.find(arg1, "item:(%d+)")
             if itemID then
                 itemID = tonumber(itemID)
@@ -1699,11 +1711,12 @@ frame:SetScript("OnEvent", function()
                     RecordMobLootItem(ownerName, itemID, session.loot[itemID].name, qty)
                 end
             end
-        else
-            -- Someone else's pickup ("PlayerName receives loot: [Item]."),
-            -- still worth showing in the window so a mob's full drop
-            -- table is visible even for items you didn't win - recorded
-            -- separately via RecordMobUnclaimedItem, which never touches
+        elseif isOtherPickup then
+            -- Someone else's pickup ("PlayerName receives loot: [Item]." or
+            -- the roll winner announcement "Name won: [Item]"), still
+            -- worth showing in the window so a mob's full drop table is
+            -- visible even for items you didn't win - recorded separately
+            -- via RecordMobUnclaimedItem, which never touches
             -- itemTotal/value (see RefreshLootWindow).
             local _, _, itemID = string.find(arg1, "item:(%d+)")
             if itemID then
@@ -1730,6 +1743,11 @@ frame:SetScript("OnEvent", function()
             elseif debugKillTracking then
                 Print("[debug] CHAT_MSG_LOOT ignored (no item link, not the player's own pickup): \"" .. tostring(arg1) .. "\"")
             end
+        elseif debugKillTracking then
+            -- Roll-in-progress noise (e.g. "Greed Roll - N for [Item] by
+            -- Name") - not a loot event at all, just the bidding process,
+            -- one line per person who rolled on the same single item.
+            Print("[debug] CHAT_MSG_LOOT ignored (not a loot receipt): \"" .. tostring(arg1) .. "\"")
         end
 
     elseif event == "CHAT_MSG_MONEY" then
