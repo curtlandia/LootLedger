@@ -1,5 +1,5 @@
 ## Interface: 11200
-## Title: |cffa335eeLootLedger|r
+## Title: |cffa335eeLootLedger|r by |cffff0000K|r|cffff7f00o|r|cffffff00b|r|cff00ff00e|r|cff0080ffn|r|cff8b00ffi|r
 ## Notes: Tracks kills, loot, and coin in real time and reports your gold/hour, with a persistent per-mob loot history.
 ## Author: curtlandia
 ## Version: 1.2.0
