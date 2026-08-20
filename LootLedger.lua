@@ -1,5 +1,5 @@
 --[[
-LootLedger v1.2.0
+LootLedger v1.3.0
 
 A gold/hour and loot tracker for vanilla WoW 1.12. Tracking runs
 continuously in the background - kills and loot are valued automatically
@@ -90,15 +90,71 @@ local EXCLUDED_ITEM_NAMES = {
     ["Soul Shard"] = true,
 }
 
+-- ---------------------------------------------------------------------
+-- Item identity - itemID + random suffix
+-- ---------------------------------------------------------------------
+--
+-- A randomly-enchanted item ("Combat Boots of the Boar") shares an
+-- itemID with the base item and every OTHER suffix roll of it
+-- ("...of the Bear", "...of the Whale", etc) - GetItemInfo(itemID)
+-- alone always resolves to the base, unsuffixed item, and Aux's own AH
+-- price history is keyed by itemID+suffix (aux-addon/util/info.lua
+-- M.item_key: item_id .. ':' .. suffix_id), not itemID alone, since
+-- different rolls are genuinely different auctionable items with very
+-- different values (an "of the Whale" and an "of the Boar" of the same
+-- base boots are worth nothing alike). Every loot record in this file
+-- is keyed by that same "itemID:suffixID" string - an itemKey - instead
+-- of a bare itemID, so different rolls get tracked (and priced)
+-- separately. suffixID is 0 for the overwhelmingly common case of an
+-- item with no random property at all, so most keys look like "6522:0".
+
+-- Vanilla's link field order is item:itemID:enchantID:suffixID:uniqueID
+-- [...]. Loose match (no color-code/|H prefix required) rather than
+-- anchoring the whole |c...|H...|h pattern - same looseness the
+-- original single-itemID extraction already relied on. The bracketed
+-- display name is pulled straight from the chat text too, rather than
+-- re-resolved via GetItemInfo - it's already the correct suffixed name
+-- the client itself generated, and doesn't depend on GetItemInfo having
+-- this exact suffix combination cached yet.
+local function ParseItemLink(text)
+    local _, _, itemID, suffixID = string.find(text, "item:(%d+):%d+:(%d+)")
+    if not itemID then return nil end
+    local _, _, name = string.find(text, "%[(.-)%]")
+    return tonumber(itemID), tonumber(suffixID) or 0, name
+end
+
+local function BuildItemKey(itemID, suffixID)
+    return tostring(itemID) .. ":" .. tostring(suffixID or 0)
+end
+
+-- Pre-migration data (or a stray bare itemID passed in from somewhere)
+-- falls back to suffix 0 - see MigrateItemKeys further down for the
+-- SavedVariables side of this same fallback.
+local function SplitItemKey(itemKey)
+    local s = tostring(itemKey)
+    local _, _, itemID, suffixID = string.find(s, "^(%d+):(%d+)$")
+    if not itemID then return tonumber(s) or 0, 0 end
+    return tonumber(itemID), tonumber(suffixID)
+end
+
+-- The itemstring GetItemInfo needs to resolve a suffixed item
+-- correctly - mirrors aux-addon's own util/info.lua M.item() pattern
+-- (enchant/unique zeroed; only itemID+suffixID affect name/stats/
+-- price/texture).
+local function ItemStringForKey(itemKey)
+    local itemID, suffixID = SplitItemKey(itemKey)
+    return "item:" .. itemID .. ":0:" .. suffixID .. ":0"
+end
+
 -- User-added items (right-click an item icon -> Filter This Item),
 -- persisted so they stay filtered across sessions. Same treatment as
 -- EXCLUDED_ITEM_NAMES above - never recorded going forward, and hidden
 -- retroactively from existing history at render time.
-local function IsExcludedItem(itemID)
-    if LootLedgerDB and LootLedgerDB.filteredItems and LootLedgerDB.filteredItems[itemID] then
+local function IsExcludedItem(itemKey)
+    if LootLedgerDB and LootLedgerDB.filteredItems and LootLedgerDB.filteredItems[itemKey] then
         return true
     end
-    local name = GetItemInfo(itemID)
+    local name = GetItemInfo(ItemStringForKey(itemKey))
     return name and EXCLUDED_ITEM_NAMES[name]
 end
 
@@ -133,7 +189,15 @@ end
 -- point), then sorted by price - the value where cumulative weight first
 -- crosses 50% is the median. Falls back to daily_min_buyout (today's
 -- not-yet-pushed low) when there's no history yet, same as Aux does.
-local function GetAuxPrice(itemID)
+--
+-- Looks up factionData.history[itemKey] directly - itemKey already
+-- matches Aux's own item_key format exactly (see the item-identity
+-- section above), so this is a real key match, not a prefix guess. A
+-- prefix scan on the bare itemID (the old approach here) would actually
+-- match EVERY suffix variant's entry ("6522:0", "6522:867", "6522:900"
+-- all start with "6522:"), silently returning whichever one pairs()
+-- happened to enumerate first - an exact key is both correct and O(1).
+local function GetAuxPrice(itemKey)
     if not aux or not aux.faction then
         return nil
     end
@@ -145,66 +209,62 @@ local function GetAuxPrice(itemID)
         return nil
     end
 
-    local idStr = tostring(itemID) .. ":"
-    local idLen = strlen(idStr)
+    local valstr = factionData.history[itemKey]
+    if not valstr then
+        return nil
+    end
 
-    for histKey, valstr in pairs(factionData.history) do
-        if string.sub(histKey, 1, idLen) == idStr then
-            -- format: "next_push#daily_min_buyout#price@ts;price@ts;..."
-            local _, _, mainTS, mainPrice, rest = string.find(valstr, "^(%d+)#([%d%.]*)#?(.*)$")
-            mainPrice = tonumber(mainPrice)
+    -- format: "next_push#daily_min_buyout#price@ts;price@ts;..."
+    local _, _, mainTS, mainPrice, rest = string.find(valstr, "^(%d+)#([%d%.]*)#?(.*)$")
+    mainPrice = tonumber(mainPrice)
 
-            local points = {}
-            local remaining = rest
-            while remaining and remaining ~= "" do
-                local _, e, p, t = string.find(remaining, "^([%d%.]+)@(%d+)")
-                if not p then break end
-                table.insert(points, { price = tonumber(p), ts = tonumber(t) })
-                remaining = string.sub(remaining, e + 1)
-                if string.sub(remaining, 1, 1) == ";" then
-                    remaining = string.sub(remaining, 2)
-                else
-                    break
-                end
-            end
-
-            if table.getn(points) == 0 then
-                return mainPrice
-            end
-
-            -- Aux inserts new points at index 1, so points[1] is newest -
-            -- but our parse order isn't guaranteed to preserve that, so
-            -- find the newest timestamp explicitly rather than assume it.
-            local newestTS = points[1].ts
-            for i = 2, table.getn(points) do
-                if points[i].ts > newestTS then
-                    newestTS = points[i].ts
-                end
-            end
-
-            local totalWeight = 0
-            for i = 1, table.getn(points) do
-                local days = math.floor((newestTS - points[i].ts) / 86400 + 0.5)
-                points[i].weight = 0.99 ^ days
-                totalWeight = totalWeight + points[i].weight
-            end
-            for i = 1, table.getn(points) do
-                points[i].weight = points[i].weight / totalWeight
-            end
-
-            table.sort(points, function(a, b) return a.price < b.price end)
-            local cum = 0
-            for i = 1, table.getn(points) do
-                cum = cum + points[i].weight
-                if cum >= 0.5 then
-                    return points[i].price
-                end
-            end
-            return points[table.getn(points)].price
+    local points = {}
+    local remaining = rest
+    while remaining and remaining ~= "" do
+        local _, e, p, t = string.find(remaining, "^([%d%.]+)@(%d+)")
+        if not p then break end
+        table.insert(points, { price = tonumber(p), ts = tonumber(t) })
+        remaining = string.sub(remaining, e + 1)
+        if string.sub(remaining, 1, 1) == ";" then
+            remaining = string.sub(remaining, 2)
+        else
+            break
         end
     end
 
-    return nil
+    if table.getn(points) == 0 then
+        return mainPrice
+    end
+
+    -- Aux inserts new points at index 1, so points[1] is newest -
+    -- but our parse order isn't guaranteed to preserve that, so
+    -- find the newest timestamp explicitly rather than assume it.
+    local newestTS = points[1].ts
+    for i = 2, table.getn(points) do
+        if points[i].ts > newestTS then
+            newestTS = points[i].ts
+        end
+    end
+
+    local totalWeight = 0
+    for i = 1, table.getn(points) do
+        local days = math.floor((newestTS - points[i].ts) / 86400 + 0.5)
+        points[i].weight = 0.99 ^ days
+        totalWeight = totalWeight + points[i].weight
+    end
+    for i = 1, table.getn(points) do
+        points[i].weight = points[i].weight / totalWeight
+    end
+
+    table.sort(points, function(a, b) return a.price < b.price end)
+    local cum = 0
+    for i = 1, table.getn(points) do
+        cum = cum + points[i].weight
+        if cum >= 0.5 then
+            return points[i].price
+        end
+    end
+    return points[table.getn(points)].price
 end
 
 -- Extracts a copper total out of a chat message containing amounts like
@@ -231,7 +291,7 @@ end
 -- Only meaningful for armor/weapons above a certain quality, so nil
 -- (not zero) for anything else - handled the same as "no price data"
 -- by GetBestPrice below.
-local function GetDisenchantValue(itemID)
+local function GetDisenchantValue(itemKey)
     if not require then return nil end
     local ok, mod = pcall(require, "aux.core.disenchant")
     if not ok or not mod or not mod.value then return nil end
@@ -243,8 +303,13 @@ local function GetDisenchantValue(itemID)
     -- for that, rather than reusing GetBestPrice's own destructuring
     -- below (worked out for a different field - sellPrice - and not
     -- guaranteed to line up the same way for these ones).
-    local name, itemstring, quality, level, class, subclass, max_stack, slot, texture = GetItemInfo(itemID)
+    local itemID = SplitItemKey(itemKey)
+    local name, itemstring, quality, level, class, subclass, max_stack, slot, texture = GetItemInfo(ItemStringForKey(itemKey))
     if not name then return nil end
+    -- DE yield only depends on the base item's slot/quality/level, never
+    -- the random suffix, so the plain itemID (not the full itemKey) is
+    -- the right 4th argument here - matches what mod.value actually
+    -- expects (see aux-addon/core/disenchant.lua).
     local ok2, value = pcall(mod.value, slot, quality, level, itemID)
     if not ok2 then return nil end
     return value
@@ -258,9 +323,9 @@ end
 -- - it never returns minLevel, so every field from there onward is
 -- shifted one position early. Dropping the minLevel placeholder from the
 -- destructuring below realigns everything correctly.
-local function GetBestPrice(itemID)
-    local name, link, quality, ilvl, itype, isub, stack, equip, texture, sellPrice = GetItemInfo(itemID)
-    local auxPrice = GetAuxPrice(itemID)
+local function GetBestPrice(itemKey)
+    local name, link, quality, ilvl, itype, isub, stack, equip, texture, sellPrice = GetItemInfo(ItemStringForKey(itemKey))
+    local auxPrice = GetAuxPrice(itemKey)
 
     sellPrice = sellPrice or 0
     auxPrice = auxPrice or 0
@@ -270,7 +335,7 @@ local function GetBestPrice(itemID)
     if auxPrice > best then best, source = auxPrice, "AH" end
 
     if LootLedgerDB and LootLedgerDB.useDisenchantValue then
-        local deValue = GetDisenchantValue(itemID)
+        local deValue = GetDisenchantValue(itemKey)
         if deValue and deValue > best then
             best, source = deValue, "DE"
         end
@@ -300,10 +365,10 @@ local function StartSession(silent)
         kills = 0,
         unattributedKills = 0, -- death messages with no parseable mob name
         mobKills = {}, -- [name] or [name..":"..level] = { name = ..., level = ..., count = N }
-        loot = {}, -- [itemID] = { name = ..., link = ..., count = N }
+        loot = {}, -- [itemKey ("itemID:suffixID")] = { name = ..., link = ..., count = N }
         moneyLooted = 0, -- copper, from CHAT_MSG_MONEY
         corpseOwner = {}, -- [guid] = mobName (level-agnostic), for attributing loot to the mob that dropped it
-        mobLoot = {}, -- [mobName] = { kills, moneyLooted, items = { [itemID] = { name, count } } } - session-scoped mirror of LootLedgerDB.mobLoot, for the loot tracker window's "this session" view
+        mobLoot = {}, -- [mobName] = { kills, moneyLooted, items = { [itemKey] = { name, count } } } - session-scoped mirror of LootLedgerDB.mobLoot, for the loot tracker window's "this session" view
         lastResolvedCorpse = nil, -- { name, time } - most recent successful target->corpseOwner match, used as a short-lived fallback (see ResolveLootOwner)
         lastKilledMob = nil, -- { name, time } - most recent confirmed kill of any tracked mob, used as a longer-lived raid-loot fallback (see ResolveLootOwner)
     }
@@ -462,19 +527,19 @@ local function RecordMobKillForDrops(mobName)
     MaybeRefreshLootWindow()
 end
 
-local function RecordMobLootItem(mobName, itemID, itemName, qty)
+local function RecordMobLootItem(mobName, itemKey, itemName, qty)
     local rec = EnsureMobLootRecord(mobName)
-    if not rec.items[itemID] then
-        rec.items[itemID] = { name = itemName, count = 0 }
+    if not rec.items[itemKey] then
+        rec.items[itemKey] = { name = itemName, count = 0 }
     end
-    rec.items[itemID].count = rec.items[itemID].count + qty
+    rec.items[itemKey].count = rec.items[itemKey].count + qty
 
     local sessionRec = EnsureSessionMobLootRecord(mobName)
     if sessionRec then
-        if not sessionRec.items[itemID] then
-            sessionRec.items[itemID] = { name = itemName, count = 0 }
+        if not sessionRec.items[itemKey] then
+            sessionRec.items[itemKey] = { name = itemName, count = 0 }
         end
-        sessionRec.items[itemID].count = sessionRec.items[itemID].count + qty
+        sessionRec.items[itemKey].count = sessionRec.items[itemKey].count + qty
     end
     MaybeRefreshLootWindow()
 end
@@ -484,21 +549,21 @@ end
 -- kept separate from rec.items so they're visible in the window (greyed
 -- out, see RefreshLootWindow) but never contribute to itemTotal/value,
 -- since the player never actually got them.
-local function RecordMobUnclaimedItem(mobName, itemID, itemName, qty)
+local function RecordMobUnclaimedItem(mobName, itemKey, itemName, qty)
     local rec = EnsureMobLootRecord(mobName)
     rec.unclaimed = rec.unclaimed or {}
-    if not rec.unclaimed[itemID] then
-        rec.unclaimed[itemID] = { name = itemName, count = 0 }
+    if not rec.unclaimed[itemKey] then
+        rec.unclaimed[itemKey] = { name = itemName, count = 0 }
     end
-    rec.unclaimed[itemID].count = rec.unclaimed[itemID].count + qty
+    rec.unclaimed[itemKey].count = rec.unclaimed[itemKey].count + qty
 
     local sessionRec = EnsureSessionMobLootRecord(mobName)
     if sessionRec then
         sessionRec.unclaimed = sessionRec.unclaimed or {}
-        if not sessionRec.unclaimed[itemID] then
-            sessionRec.unclaimed[itemID] = { name = itemName, count = 0 }
+        if not sessionRec.unclaimed[itemKey] then
+            sessionRec.unclaimed[itemKey] = { name = itemName, count = 0 }
         end
-        sessionRec.unclaimed[itemID].count = sessionRec.unclaimed[itemID].count + qty
+        sessionRec.unclaimed[itemKey].count = sessionRec.unclaimed[itemKey].count + qty
     end
     MaybeRefreshLootWindow()
 end
@@ -548,14 +613,14 @@ local function BuildKillBreakdown()
 end
 
 local function BuildBreakdown()
-    -- returns a sorted array of {itemID, name, link, count, unitPrice, source, total}
+    -- returns a sorted array of {itemKey, name, link, count, unitPrice, source, total}
     -- and the grand total, sorted by total value descending
     local rows = {}
     local grandTotal = 0
     local anyUnknown = false
 
-    for itemID, data in pairs(session.loot) do
-        local price, source = GetBestPrice(itemID)
+    for itemKey, data in pairs(session.loot) do
+        local price, source = GetBestPrice(itemKey)
         local total = 0
         if price then
             total = price * data.count
@@ -564,7 +629,7 @@ local function BuildBreakdown()
             anyUnknown = true
         end
         table.insert(rows, {
-            itemID = itemID,
+            itemKey = itemKey,
             name = data.name,
             link = data.link,
             count = data.count,
@@ -696,7 +761,7 @@ local function StopSession()
 
     local lootLog = {}
     for _, row in ipairs(rows) do
-        table.insert(lootLog, { itemID = row.itemID, name = row.name, count = row.count, total = row.total })
+        table.insert(lootLog, { itemKey = row.itemKey, name = row.name, count = row.count, total = row.total })
     end
     local killLog = {}
     for _, kr in ipairs(killRows) do
@@ -906,20 +971,20 @@ end
 -- item everywhere (see IsExcludedItem) and stops it from being recorded
 -- going forward; removing it again is done from the Options window,
 -- which lists everything currently filtered.
-local itemFilterMenuTarget = nil -- itemID
+local itemFilterMenuTarget = nil -- itemKey
 local itemFilterMenuFrame = nil
 
-local function FilterItem(itemID)
-    if not itemID then return end
+local function FilterItem(itemKey)
+    if not itemKey then return end
     LootLedgerDB = LootLedgerDB or { sessions = {} }
     LootLedgerDB.filteredItems = LootLedgerDB.filteredItems or {}
-    LootLedgerDB.filteredItems[itemID] = true
+    LootLedgerDB.filteredItems[itemKey] = true
     MaybeRefreshLootWindow()
     if RefreshOptionsWindow then RefreshOptionsWindow() end
 end
 
 local function InitItemFilterMenu()
-    local itemName = itemFilterMenuTarget and (GetItemInfo(itemFilterMenuTarget) or ("item " .. itemFilterMenuTarget))
+    local itemName = itemFilterMenuTarget and (GetItemInfo(ItemStringForKey(itemFilterMenuTarget)) or ("item " .. itemFilterMenuTarget))
     local info = UIDropDownMenu_CreateInfo()
     info.text = itemName or ""
     info.isTitle = true
@@ -935,8 +1000,8 @@ local function InitItemFilterMenu()
     UIDropDownMenu_AddButton(info)
 end
 
-local function ShowItemFilterMenu(itemID)
-    itemFilterMenuTarget = itemID
+local function ShowItemFilterMenu(itemKey)
+    itemFilterMenuTarget = itemKey
     if not itemFilterMenuFrame then
         itemFilterMenuFrame = CreateFrame("Frame", "LootLedgerItemFilterMenu", UIParent, "UIDropDownMenuTemplate")
     end
@@ -985,16 +1050,17 @@ local function GetIconButton(index)
     countText:SetTextColor(1, 1, 0.4)
     b.countText = countText
 
-    -- reconstructed minimal item link (only itemID matters for a tooltip;
-    -- the real link's enchant/gem/etc. segments aren't tracked, so zeroed)
+    -- reconstructed minimal item link (enchant/gem/unique segments aren't
+    -- tracked, so zeroed - only itemID+suffixID matter for a tooltip,
+    -- see ItemStringForKey)
     b:SetScript("OnEnter", function()
         if this.moneyTotal then
             GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
             GameTooltip:SetText("Coin: " .. FormatGold(this.moneyTotal))
             GameTooltip:Show()
-        elseif this.itemID then
+        elseif this.itemKey then
             GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-            GameTooltip:SetHyperlink("item:" .. this.itemID .. ":0:0:0:0:0:0:0")
+            GameTooltip:SetHyperlink(ItemStringForKey(this.itemKey))
             if this.unclaimed then
                 GameTooltip:AddLine("Looted by someone else - not counted", 0.7, 0.7, 0.7)
             end
@@ -1003,10 +1069,10 @@ local function GetIconButton(index)
         end
     end)
     -- Right-click opens a small menu to filter this item out entirely
-    -- (see FilterItem) - not the coin slot, which has no itemID.
+    -- (see FilterItem) - not the coin slot, which has no itemKey.
     b:SetScript("OnMouseUp", function()
-        if arg1 == "RightButton" and this.itemID then
-            ShowItemFilterMenu(this.itemID)
+        if arg1 == "RightButton" and this.itemKey then
+            ShowItemFilterMenu(this.itemKey)
         end
     end)
     b:SetScript("OnLeave", function()
@@ -1552,20 +1618,20 @@ RefreshLootWindow = function()
     for mobName, rec in pairs(store) do
         local itemTotal = 0
         local itemRows = {}
-        for itemID, data in pairs(rec.items) do
+        for itemKey, data in pairs(rec.items) do
             -- Filters excluded items (e.g. Soul Shard) out of the display
             -- even if they were recorded before the filter existed -
             -- IsExcludedItem() at the CHAT_MSG_LOOT level only stops NEW
             -- pickups from being recorded, it can't retroactively clean
             -- SavedVariables data from earlier sessions.
-            if not IsExcludedItem(itemID) then
-                local price, source = GetBestPrice(itemID)
+            if not IsExcludedItem(itemKey) then
+                local price, source = GetBestPrice(itemKey)
                 local total = (price or 0) * data.count
                 itemTotal = itemTotal + total
-                table.insert(itemRows, { itemID = itemID, count = data.count, total = total })
+                table.insert(itemRows, { itemKey = itemKey, count = data.count, total = total })
                 if debugKillTracking then
-                    Print(string.format("[debug] price: itemID=%s name=%s count=%d unitPrice=%s source=%s total=%s",
-                        tostring(itemID), tostring(data.name), data.count, price and FormatGold(price) or "nil",
+                    Print(string.format("[debug] price: itemKey=%s name=%s count=%d unitPrice=%s source=%s total=%s",
+                        tostring(itemKey), tostring(data.name), data.count, price and FormatGold(price) or "nil",
                         tostring(source), FormatGold(total)))
                 end
             end
@@ -1580,9 +1646,9 @@ RefreshLootWindow = function()
         -- out (see icon rendering below) at total=0 so they never affect
         -- itemTotal/value, but still visible as "this dropped here."
         if rec.unclaimed then
-            for itemID, data in pairs(rec.unclaimed) do
-                if not IsExcludedItem(itemID) then
-                    table.insert(itemRows, { itemID = itemID, count = data.count, total = 0, unclaimed = true })
+            for itemKey, data in pairs(rec.unclaimed) do
+                if not IsExcludedItem(itemKey) then
+                    table.insert(itemRows, { itemKey = itemKey, count = data.count, total = 0, unclaimed = true })
                 end
             end
         end
@@ -1671,23 +1737,23 @@ RefreshLootWindow = function()
                 btn.icon:SetVertexColor(1, 1, 1)
                 btn:SetAlpha(1)
                 btn.countText:SetText(FormatGoldShort(ir.total))
-                btn.itemID = nil
+                btn.itemKey = nil
                 btn.moneyTotal = ir.total
                 btn.unclaimed = false
                 btn.border:SetBackdropBorderColor(1, 0.82, 0, 1)
             else
                 -- Same shifted-fields destructuring as GetBestPrice - see
                 -- its comment for why.
-                local name, link, quality, ilvl, itype, isub, stack, equip, texture, sellPrice = GetItemInfo(ir.itemID)
+                local name, link, quality, ilvl, itype, isub, stack, equip, texture, sellPrice = GetItemInfo(ItemStringForKey(ir.itemKey))
                 if debugKillTracking then
-                    Print(string.format("[debug] icon: itemID=%s texture=%s", tostring(ir.itemID), tostring(texture)))
+                    Print(string.format("[debug] icon: itemKey=%s texture=%s", tostring(ir.itemKey), tostring(texture)))
                 end
                 if not texture or texture == "" or type(texture) == "number" then
                     texture = "Interface\\Icons\\INV_Misc_QuestionMark"
                 end
                 btn.icon:SetTexture(texture)
                 btn.countText:SetText(tostring(ir.count))
-                btn.itemID = ir.itemID
+                btn.itemKey = ir.itemKey
                 btn.moneyTotal = nil
                 btn.unclaimed = ir.unclaimed or false
                 if quality and quality >= 0 then
@@ -1760,9 +1826,9 @@ local optionsContent
 local optionsRowPool = {}
 local deCheckbox
 
-local function UnfilterItem(itemID)
-    if not itemID or not LootLedgerDB or not LootLedgerDB.filteredItems then return end
-    LootLedgerDB.filteredItems[itemID] = nil
+local function UnfilterItem(itemKey)
+    if not itemKey or not LootLedgerDB or not LootLedgerDB.filteredItems then return end
+    LootLedgerDB.filteredItems[itemKey] = nil
     MaybeRefreshLootWindow()
     if RefreshOptionsWindow then RefreshOptionsWindow() end
 end
@@ -1788,7 +1854,7 @@ local function GetOptionsRow(index)
     removeBtn:SetPoint("RIGHT", row, "RIGHT", 0, 0)
     removeBtn:SetText("x")
     removeBtn:SetScript("OnClick", function()
-        UnfilterItem(this.itemID)
+        UnfilterItem(this.itemKey)
     end)
     removeBtn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_LEFT")
@@ -1903,13 +1969,13 @@ RefreshOptionsWindow = function()
     deCheckbox:SetChecked(LootLedgerDB and LootLedgerDB.useDisenchantValue)
 
     local filtered = (LootLedgerDB and LootLedgerDB.filteredItems) or {}
-    local itemIDs = {}
-    for itemID in pairs(filtered) do
-        table.insert(itemIDs, itemID)
+    local itemKeys = {}
+    for itemKey in pairs(filtered) do
+        table.insert(itemKeys, itemKey)
     end
-    table.sort(itemIDs, function(a, b) return a < b end)
+    table.sort(itemKeys, function(a, b) return a < b end)
 
-    if table.getn(itemIDs) == 0 then
+    if table.getn(itemKeys) == 0 then
         optionsWindow.emptyText:Show()
     else
         optionsWindow.emptyText:Hide()
@@ -1917,19 +1983,19 @@ RefreshOptionsWindow = function()
 
     local yOffset = 0
     local used = 0
-    for _, itemID in ipairs(itemIDs) do
+    for _, itemKey in ipairs(itemKeys) do
         used = used + 1
         local row = GetOptionsRow(used)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", optionsContent, "TOPLEFT", 0, -yOffset)
-        local name, link, quality, ilvl, itype, isub, stack, equip, texture = GetItemInfo(itemID)
-        row.nameText:SetText(name or ("item " .. itemID))
+        local name, link, quality, ilvl, itype, isub, stack, equip, texture = GetItemInfo(ItemStringForKey(itemKey))
+        row.nameText:SetText(name or ("item " .. itemKey))
         if texture and texture ~= "" and type(texture) ~= "number" then
             row.icon:SetTexture(texture)
         else
             row.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
         end
-        row.removeBtn.itemID = itemID
+        row.removeBtn.itemKey = itemKey
         row:Show()
         yOffset = yOffset + OPTIONS_ROW_HEIGHT
     end
@@ -2390,10 +2456,10 @@ frame:SetScript("OnEvent", function()
             and (string.find(arg1, "receives loot:") or string.find(arg1, " won: "))
 
         if isOwnPickup then
-            local _, _, itemID = string.find(arg1, "item:(%d+)")
+            local itemID, suffixID, parsedName = ParseItemLink(arg1)
             if itemID then
-                itemID = tonumber(itemID)
-                if IsExcludedItem(itemID) then
+                local itemKey = BuildItemKey(itemID, suffixID)
+                if IsExcludedItem(itemKey) then
                     if debugKillTracking then
                         Print("[debug] CHAT_MSG_LOOT ignored (excluded item, e.g. Soul Shard): \"" .. tostring(arg1) .. "\"")
                     end
@@ -2403,15 +2469,14 @@ frame:SetScript("OnEvent", function()
                 local _, _, qtyStr = string.find(arg1, "%]x(%d+)")
                 if qtyStr then qty = tonumber(qtyStr) end
 
-                if not session.loot[itemID] then
-                    local name, link = GetItemInfo(itemID)
-                    session.loot[itemID] = {
-                        name = name or ("item " .. itemID),
-                        link = link,
+                if not session.loot[itemKey] then
+                    session.loot[itemKey] = {
+                        name = parsedName or ("item " .. itemKey),
+                        link = ItemStringForKey(itemKey),
                         count = 0,
                     }
                 end
-                session.loot[itemID].count = session.loot[itemID].count + qty
+                session.loot[itemKey].count = session.loot[itemKey].count + qty
 
                 -- attribute this loot to whichever mob's corpse it came
                 -- from, if the corpse being looted is one we tracked a
@@ -2422,10 +2487,10 @@ frame:SetScript("OnEvent", function()
                 local ownerName, method = ResolveLootOwner()
                 if debugKillTracking then
                     Print(string.format("[debug] CHAT_MSG_LOOT: item=%s corpseOwner=%s (%s)",
-                        tostring(session.loot[itemID].name), tostring(ownerName), tostring(method)))
+                        tostring(session.loot[itemKey].name), tostring(ownerName), tostring(method)))
                 end
                 if ownerName then
-                    RecordMobLootItem(ownerName, itemID, session.loot[itemID].name, qty)
+                    RecordMobLootItem(ownerName, itemKey, session.loot[itemKey].name, qty)
                 end
             end
         elseif isOtherPickup then
@@ -2435,10 +2500,10 @@ frame:SetScript("OnEvent", function()
             -- visible even for items you didn't win - recorded separately
             -- via RecordMobUnclaimedItem, which never touches
             -- itemTotal/value (see RefreshLootWindow).
-            local _, _, itemID = string.find(arg1, "item:(%d+)")
+            local itemID, suffixID, parsedName = ParseItemLink(arg1)
             if itemID then
-                itemID = tonumber(itemID)
-                if IsExcludedItem(itemID) then
+                local itemKey = BuildItemKey(itemID, suffixID)
+                if IsExcludedItem(itemKey) then
                     if debugKillTracking then
                         Print("[debug] CHAT_MSG_LOOT ignored (excluded item, e.g. Soul Shard): \"" .. tostring(arg1) .. "\"")
                     end
@@ -2447,7 +2512,7 @@ frame:SetScript("OnEvent", function()
                 local qty = 1
                 local _, _, qtyStr = string.find(arg1, "%]x(%d+)")
                 if qtyStr then qty = tonumber(qtyStr) end
-                local itemName = GetItemInfo(itemID) or ("item " .. itemID)
+                local itemName = parsedName or ("item " .. itemKey)
 
                 local ownerName, method = ResolveLootOwner()
                 if debugKillTracking then
@@ -2455,7 +2520,7 @@ frame:SetScript("OnEvent", function()
                         tostring(itemName), tostring(ownerName), tostring(method), tostring(arg1)))
                 end
                 if ownerName then
-                    RecordMobUnclaimedItem(ownerName, itemID, itemName, qty)
+                    RecordMobUnclaimedItem(ownerName, itemKey, itemName, qty)
                 end
             elseif debugKillTracking then
                 Print("[debug] CHAT_MSG_LOOT ignored (no item link, not the player's own pickup): \"" .. tostring(arg1) .. "\"")
@@ -2590,9 +2655,11 @@ SlashCmdList["LOOTLEDGER"] = function(msg)
         end
 
     elseif cmd == "debugprice" then
-        local itemID = tonumber(rest)
+        local _, _, idPart, suffixPart = string.find(rest or "", "^(%d+)%s*(%d*)$")
+        local itemID = idPart and tonumber(idPart)
+        local suffixID = (suffixPart and suffixPart ~= "" and tonumber(suffixPart)) or 0
         if not itemID then
-            Print("Usage: /ll debugprice <itemID> (e.g. /ll debugprice 7611)")
+            Print("Usage: /ll debugprice <itemID> [suffixID] (e.g. /ll debugprice 7611, or /ll debugprice 8345 867 for a suffixed roll)")
         elseif not aux or not aux.faction then
             Print("aux global not found.")
         else
@@ -2603,73 +2670,68 @@ SlashCmdList["LOOTLEDGER"] = function(msg)
             if not factionData or not factionData.history then
                 Print("No history data under your key (" .. key .. ").")
             else
-                local idStr = tostring(itemID) .. ":"
-                local idLen = strlen(idStr)
-                local matched = false
-                for histKey, valstr in pairs(factionData.history) do
-                    if not matched and string.sub(histKey, 1, idLen) == idStr then
-                        matched = true
-                        Print(string.format("  raw: %s = %s", histKey, tostring(valstr)))
-                        local _, _, mainTS, mainPrice, rest2 = string.find(valstr, "^(%d+)#([%d%.]*)#?(.*)$")
-                        mainPrice = tonumber(mainPrice)
+                local itemKey = BuildItemKey(itemID, suffixID)
+                local valstr = factionData.history[itemKey]
+                if not valstr then
+                    Print("No history entry found for itemKey " .. itemKey .. " under key " .. key)
+                else
+                    Print(string.format("  raw: %s = %s", itemKey, tostring(valstr)))
+                    local _, _, mainTS, mainPrice, rest2 = string.find(valstr, "^(%d+)#([%d%.]*)#?(.*)$")
+                    mainPrice = tonumber(mainPrice)
 
-                        local points = {}
-                        local remaining = rest2
-                        while remaining and remaining ~= "" do
-                            local _, e, p, t = string.find(remaining, "^([%d%.]+)@(%d+)")
-                            if not p then break end
-                            table.insert(points, { price = tonumber(p), ts = tonumber(t) })
-                            remaining = string.sub(remaining, e + 1)
-                            if string.sub(remaining, 1, 1) == ";" then
-                                remaining = string.sub(remaining, 2)
-                            else
+                    local points = {}
+                    local remaining = rest2
+                    while remaining and remaining ~= "" do
+                        local _, e, p, t = string.find(remaining, "^([%d%.]+)@(%d+)")
+                        if not p then break end
+                        table.insert(points, { price = tonumber(p), ts = tonumber(t) })
+                        remaining = string.sub(remaining, e + 1)
+                        if string.sub(remaining, 1, 1) == ";" then
+                            remaining = string.sub(remaining, 2)
+                        else
+                            break
+                        end
+                    end
+
+                    if table.getn(points) == 0 then
+                        Print(string.format("No data_points yet - falling back to daily_min_buyout: %s",
+                            mainPrice and FormatGold(mainPrice) or "nil"))
+                    else
+                        local newestTS = points[1].ts
+                        for i = 2, table.getn(points) do
+                            if points[i].ts > newestTS then newestTS = points[i].ts end
+                        end
+                        local totalWeight = 0
+                        for i = 1, table.getn(points) do
+                            local days = math.floor((newestTS - points[i].ts) / 86400 + 0.5)
+                            points[i].weight = 0.99 ^ days
+                            totalWeight = totalWeight + points[i].weight
+                        end
+                        for i = 1, table.getn(points) do
+                            points[i].weight = points[i].weight / totalWeight
+                        end
+                        local byTime = {}
+                        for i = 1, table.getn(points) do byTime[i] = points[i] end
+                        table.sort(byTime, function(a, b) return a.ts > b.ts end)
+                        Print(string.format("%d data_points (newest first):", table.getn(byTime)))
+                        for i = 1, table.getn(byTime) do
+                            Print(string.format("  %s  ts=%s  weight=%.3f", FormatGold(byTime[i].price), tostring(byTime[i].ts), byTime[i].weight))
+                        end
+
+                        local byPrice = {}
+                        for i = 1, table.getn(points) do byPrice[i] = points[i] end
+                        table.sort(byPrice, function(a, b) return a.price < b.price end)
+                        local cum = 0
+                        local result = byPrice[table.getn(byPrice)].price
+                        for i = 1, table.getn(byPrice) do
+                            cum = cum + byPrice[i].weight
+                            if cum >= 0.5 then
+                                result = byPrice[i].price
                                 break
                             end
                         end
-
-                        if table.getn(points) == 0 then
-                            Print(string.format("No data_points yet - falling back to daily_min_buyout: %s",
-                                mainPrice and FormatGold(mainPrice) or "nil"))
-                        else
-                            local newestTS = points[1].ts
-                            for i = 2, table.getn(points) do
-                                if points[i].ts > newestTS then newestTS = points[i].ts end
-                            end
-                            local totalWeight = 0
-                            for i = 1, table.getn(points) do
-                                local days = math.floor((newestTS - points[i].ts) / 86400 + 0.5)
-                                points[i].weight = 0.99 ^ days
-                                totalWeight = totalWeight + points[i].weight
-                            end
-                            for i = 1, table.getn(points) do
-                                points[i].weight = points[i].weight / totalWeight
-                            end
-                            local byTime = {}
-                            for i = 1, table.getn(points) do byTime[i] = points[i] end
-                            table.sort(byTime, function(a, b) return a.ts > b.ts end)
-                            Print(string.format("%d data_points (newest first):", table.getn(byTime)))
-                            for i = 1, table.getn(byTime) do
-                                Print(string.format("  %s  ts=%s  weight=%.3f", FormatGold(byTime[i].price), tostring(byTime[i].ts), byTime[i].weight))
-                            end
-
-                            local byPrice = {}
-                            for i = 1, table.getn(points) do byPrice[i] = points[i] end
-                            table.sort(byPrice, function(a, b) return a.price < b.price end)
-                            local cum = 0
-                            local result = byPrice[table.getn(byPrice)].price
-                            for i = 1, table.getn(byPrice) do
-                                cum = cum + byPrice[i].weight
-                                if cum >= 0.5 then
-                                    result = byPrice[i].price
-                                    break
-                                end
-                            end
-                            Print(string.format("GetAuxPrice() weighted median would return: %s", FormatGold(result)))
-                        end
+                        Print(string.format("GetAuxPrice() weighted median would return: %s", FormatGold(result)))
                     end
-                end
-                if not matched then
-                    Print("No history entries found for itemID " .. itemID .. " under key " .. key)
                 end
             end
         end
@@ -2694,7 +2756,7 @@ SlashCmdList["LOOTLEDGER"] = function(msg)
             end
             RecordMobMoney(mob.name, mob.money)
             for _, item in ipairs(mob.items) do
-                RecordMobLootItem(mob.name, item.id, item.name, item.qty)
+                RecordMobLootItem(mob.name, BuildItemKey(item.id, 0), item.name, item.qty)
             end
         end
         Print("Test data loaded - /ll to view it. /ll testdata again adds more (does not replace).")
@@ -2704,6 +2766,55 @@ SlashCmdList["LOOTLEDGER"] = function(msg)
 
     else
         Print("Unknown command. /ll opens the Loot Tracker - /ll help for the full command list.")
+    end
+end
+
+-- One-time per-login migration: pre-1.3.0 saves keyed loot entries by a
+-- bare numeric itemID (see the item-identity section near the top of
+-- this file). Reinterpreted as suffix 0 - the overwhelmingly common
+-- case, and the only option available, since old data never captured
+-- which suffix actually dropped - so existing history survives under
+-- the new "itemID:suffixID" keys instead of silently going invisible
+-- (every lookup against it would miss until the exact same item
+-- happened to drop again under its new key).
+local function MigrateItemKeys(t)
+    if not t then return end
+    local toMove = {}
+    local k
+    for k in pairs(t) do
+        if type(k) == "number" then
+            table.insert(toMove, k)
+        end
+    end
+    local i
+    for i = 1, table.getn(toMove) do
+        local oldKey = toMove[i]
+        local newKey = BuildItemKey(oldKey, 0)
+        if t[newKey] == nil then
+            t[newKey] = t[oldKey]
+        end
+        t[oldKey] = nil
+    end
+end
+
+local function MigrateAllItemKeys()
+    MigrateItemKeys(LootLedgerDB.filteredItems)
+    if LootLedgerDB.mobLoot then
+        local mobName, rec
+        for mobName, rec in pairs(LootLedgerDB.mobLoot) do
+            MigrateItemKeys(rec.items)
+            MigrateItemKeys(rec.unclaimed)
+        end
+    end
+    if session then
+        MigrateItemKeys(session.loot)
+        if session.mobLoot then
+            local mobName, rec
+            for mobName, rec in pairs(session.mobLoot) do
+                MigrateItemKeys(rec.items)
+                MigrateItemKeys(rec.unclaimed)
+            end
+        end
     end
 end
 
@@ -2750,7 +2861,6 @@ loginFrame:SetScript("OnEvent", function()
         session.moneyLooted = session.moneyLooted or 0
         session.mobLoot = session.mobLoot or {}
         Print(string.format("Restored session from before login (%d kills).", session.kills))
-        MaybeRefreshLootWindow()
     else
         -- No real saved session (or the placeholder is already correctly
         -- linked in) - just make sure the NOW-current LootLedgerDB (which
@@ -2759,6 +2869,11 @@ loginFrame:SetScript("OnEvent", function()
         LootLedgerDB = LootLedgerDB or { sessions = {} }
         LootLedgerDB.currentSession = session
     end
+
+    -- Only safe here, not at top-level file load - see MigrateItemKeys'
+    -- comment and the LootLedgerDB.mobLoot timing note above.
+    MigrateAllItemKeys()
+    MaybeRefreshLootWindow()
 end)
 
 -- session and LootLedgerDB.currentSession are meant to be the exact same
@@ -2773,4 +2888,4 @@ logoutFrame:SetScript("OnEvent", function()
     LootLedgerDB.currentSession = session
 end)
 
-Print("Loaded v1.2.0. Always tracking - /ll for the loot tracker.")
+Print("Loaded v1.3.0. Always tracking - /ll for the loot tracker.")
