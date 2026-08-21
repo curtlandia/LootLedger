@@ -359,9 +359,18 @@ end
 -- across logout/reload (see the bottom of this file) - it needs a clock
 -- that keeps counting correctly across a relog instead of resetting to
 -- ~0 with a new client.
+--
+-- activeSeconds/lastResumeTime track LOGGED-IN time only, separately
+-- from startTime (which is just "when this session was first created,"
+-- kept for display/history purposes) - elapsed time used to be a flat
+-- time() - startTime, which kept counting through however long you were
+-- actually logged out between sessions, badly inflating duration/kills-
+-- per-hour after any real gap. See GetSessionActiveSeconds below.
 local function StartSession(silent)
     session = {
         startTime = time(),
+        activeSeconds = 0, -- accumulated logged-in seconds from PRIOR spans (folded in on logout - see the PLAYER_LOGOUT handler)
+        lastResumeTime = time(), -- time() at the start of the CURRENT logged-in span
         kills = 0,
         unattributedKills = 0, -- death messages with no parseable mob name
         mobKills = {}, -- [name] or [name..":"..level] = { name = ..., level = ..., count = N }
@@ -381,6 +390,17 @@ local function StartSession(silent)
     if not silent then
         Print("Session reset. Go kill things.")
     end
+end
+
+-- Total logged-in seconds for the active session, live - prior spans
+-- already folded into session.activeSeconds (on logout) plus however
+-- long the CURRENT span has run since lastResumeTime. This is what
+-- every elapsed/duration display should read, never a raw
+-- time() - session.startTime, which counts real-world time straight
+-- through any gap you were actually logged out for.
+local function GetSessionActiveSeconds()
+    if not session then return 0 end
+    return (session.activeSeconds or 0) + (time() - (session.lastResumeTime or session.startTime or time()))
 end
 
 -- ---------------------------------------------------------------------
@@ -691,7 +711,7 @@ local function StopSession()
         pendingKills = {}
     end
 
-    local elapsedHours = (time() - session.startTime) / 3600
+    local elapsedHours = GetSessionActiveSeconds() / 3600
     local rows, grandTotal, anyUnknown = BuildBreakdown()
 
     Print("---- Session summary ----")
@@ -769,7 +789,7 @@ local function StopSession()
     end
     table.insert(LootLedgerDB.sessions, {
         label = sessionLabel,
-        duration = time() - session.startTime,
+        duration = GetSessionActiveSeconds(),
         kills = session.kills,
         killsByMob = killLog,
         unattributedKills = session.unattributedKills,
@@ -800,7 +820,7 @@ local function PrintStatus()
         Print("No active session.")
         return
     end
-    local elapsedMin = (time() - session.startTime) / 60
+    local elapsedMin = GetSessionActiveSeconds() / 60
     local itemCount = 0
     for _ in pairs(session.loot) do itemCount = itemCount + 1 end
     local mobCount = 0
@@ -1491,7 +1511,7 @@ local function CreateLootWindow()
             compactText:SetText("No active session.")
             return
         end
-        local elapsed = time() - session.startTime
+        local elapsed = GetSessionActiveSeconds()
         local elapsedHours = elapsed / 3600
         local mins = math.floor(elapsed / 60)
         local secs = math.floor(elapsed - mins * 60)
@@ -1738,7 +1758,7 @@ RefreshLootWindow = function()
         lootViewMode == "session" and "This Session" or "All Time", totalKills)
     local line2 = string.format("Value: |cffffd700%s|r", FormatGold(totalValue))
     if lootViewMode == "session" and session then
-        local elapsed = time() - session.startTime
+        local elapsed = GetSessionActiveSeconds()
         local mins = math.floor(elapsed / 60)
         local secs = math.floor(elapsed - mins * 60)
         line1 = line1 .. string.format(" | Time: %d:%02d", mins, secs)
@@ -2913,6 +2933,14 @@ loginFrame:SetScript("OnEvent", function()
         session.lastResolvedCorpse = nil
         session.lastKilledMob = nil
         session.startTime = session.startTime or time()
+        session.activeSeconds = session.activeSeconds or 0
+        -- Always reset, not defaulted - a fresh logged-in span starts
+        -- right now regardless of whatever this held before (see
+        -- GetSessionActiveSeconds/the PLAYER_LOGOUT handler, which is
+        -- what folds a finished span into activeSeconds). Leaving the
+        -- old value in place here is exactly what let elapsed time run
+        -- straight through the logout gap.
+        session.lastResumeTime = time()
         session.kills = session.kills or 0
         session.unattributedKills = session.unattributedKills or 0
         session.mobKills = session.mobKills or {}
@@ -2957,6 +2985,14 @@ end)
 local logoutFrame = CreateFrame("Frame")
 logoutFrame:RegisterEvent("PLAYER_LOGOUT")
 logoutFrame:SetScript("OnEvent", function()
+    -- Fold the current logged-in span into activeSeconds before it gets
+    -- written to disk - fires on a real logout AND on /reload, so this
+    -- is the one place that reliably catches "the span is ending" right
+    -- before any gap (however long) until the next PLAYER_ENTERING_WORLD
+    -- resets lastResumeTime and starts a new one.
+    if session then
+        session.activeSeconds = (session.activeSeconds or 0) + (time() - (session.lastResumeTime or session.startTime or time()))
+    end
     LootLedgerDB.currentSession = session
 end)
 
