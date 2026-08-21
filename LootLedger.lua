@@ -1083,6 +1083,47 @@ local function GetIconButton(index)
     return b
 end
 
+-- Row frames live in lootContent, which can be much taller than the
+-- actual scroll viewport once a session racks up a lot of mobs - every
+-- header and icon button has its own SetBackdrop border (see
+-- GetSectionHeader/GetIconButton above), and vanilla's renderer pays
+-- for every simultaneously-Shown backdrop frame whether or not the
+-- ScrollFrame happens to be clipping it out of view right now. With a
+-- lot of entries that's hundreds of live bordered frames, and moving or
+-- scrolling the window - both of which force a recomposite every single
+-- rendered frame - is exactly when that cost shows up as an FPS hit.
+-- Below, a row only stays Shown if it's actually within (or near) the
+-- visible scroll range; everything else gets Hidden. Positions set by
+-- the last full RefreshLootWindow stay correct while hidden, so
+-- re-showing a row on scroll-back doesn't need repositioning - only the
+-- show/hide state needs to be re-decided, which is why the scroll-tick
+-- path below is cheap (no data rebuild, no sorting, no GetItemInfo).
+local VISIBILITY_BUFFER = 60
+local lastUsedHeaders, lastUsedIcons = 0, 0
+
+local function ApplyRowVisibility(f)
+    if not f or not f.rowTop then return end
+    local viewTop = lootScrollFrame:GetVerticalScroll()
+    local viewBottom = viewTop + lootScrollFrame:GetHeight()
+    local rowBottom = f.rowTop + (f.rowHeight or 0)
+    if rowBottom >= viewTop - VISIBILITY_BUFFER and f.rowTop <= viewBottom + VISIBILITY_BUFFER then
+        f:Show()
+    else
+        f:Hide()
+    end
+end
+
+local function UpdateVisibleLootRows()
+    if not lootScrollFrame then return end
+    local i
+    for i = 1, lastUsedHeaders do
+        ApplyRowVisibility(sectionHeaderPool[i])
+    end
+    for i = 1, lastUsedIcons do
+        ApplyRowVisibility(iconButtonPool[i])
+    end
+end
+
 StaticPopupDialogs["LOOTLEDGER_RESET_ALL"] = {
     text = "Reset ALL LootLedger loot history (This Session and All Time)? This cannot be undone.",
     button1 = "Yes",
@@ -1357,6 +1398,17 @@ local function CreateLootWindow()
     local scroll = CreateFrame("ScrollFrame", "LootLedgerLootScrollFrame", f, "UIPanelScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -90)
     scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 10)
+
+    -- Wraps (not replaces) whatever OnVerticalScroll the template already
+    -- wired up, so the scrollbar's own built-in sync keeps working - this
+    -- just piggybacks a cheap show/hide pass (see UpdateVisibleLootRows)
+    -- on top, so rows scrolled into view actually reappear and rows
+    -- scrolled out actually stop costing render time.
+    local origOnVerticalScroll = scroll:GetScript("OnVerticalScroll")
+    scroll:SetScript("OnVerticalScroll", function()
+        if origOnVerticalScroll then origOnVerticalScroll() end
+        UpdateVisibleLootRows()
+    end)
 
     -- UIPanelScrollFrameTemplate names its scrollbar child "<name>ScrollBar"
     -- - pfUI.api.SkinScrollbar expects that (a Slider, has GetThumbTexture),
@@ -1719,7 +1771,9 @@ RefreshLootWindow = function()
         header.killText:SetText("x" .. mr.kills)
         header.valueText:SetText(FormatGold(mr.value))
         header.mobName = mr.name
-        header:Show()
+        header.rowTop = yOffset
+        header.rowHeight = HEADER_HEIGHT
+        ApplyRowVisibility(header)
         yOffset = yOffset + HEADER_HEIGHT + 4
 
         if collapsed then
@@ -1772,7 +1826,9 @@ RefreshLootWindow = function()
                     btn:SetAlpha(1)
                 end
             end
-            btn:Show()
+            btn.rowTop = yOffset
+            btn.rowHeight = ICON_SIZE
+            ApplyRowVisibility(btn)
 
             col = col + 1
             if col >= iconsPerRow then
@@ -1789,14 +1845,17 @@ RefreshLootWindow = function()
 
     local i = usedHeaders + 1
     while sectionHeaderPool[i] do
+        sectionHeaderPool[i].rowTop = nil
         sectionHeaderPool[i]:Hide()
         i = i + 1
     end
     i = usedIcons + 1
     while iconButtonPool[i] do
+        iconButtonPool[i].rowTop = nil
         iconButtonPool[i]:Hide()
         i = i + 1
     end
+    lastUsedHeaders, lastUsedIcons = usedHeaders, usedIcons
 
     lootContent:SetHeight(yOffset > 0 and yOffset or 1)
 end
@@ -2868,6 +2927,19 @@ loginFrame:SetScript("OnEvent", function()
         -- placeholder was created) actually points at it.
         LootLedgerDB = LootLedgerDB or { sessions = {} }
         LootLedgerDB.currentSession = session
+    end
+
+    -- aux is listed as an OptionalDep because it's genuinely optional in
+    -- the .toc-mechanics sense (LootLedger won't error without it, and
+    -- vendor sell price is still a real, if lower, fallback) - but
+    -- "reports your gold/hour" is the addon's whole pitch, and vendor
+    -- price alone systematically undervalues anything actually worth
+    -- farming. Worth an explicit heads-up rather than silently reporting
+    -- numbers that read as correct but are missing their biggest
+    -- component - checked here (not at top-level file load) for the
+    -- same load-order-safety reason as MigrateAllItemKeys below.
+    if not aux or not aux.faction then
+        Print("aux-addon not detected - gold/hour will only reflect vendor sell prices, not AH value. Install aux for accurate farming totals.")
     end
 
     -- Only safe here, not at top-level file load - see MigrateItemKeys'
