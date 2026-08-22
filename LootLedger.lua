@@ -1878,6 +1878,28 @@ RefreshLootWindow = function()
     lastUsedHeaders, lastUsedIcons = usedHeaders, usedIcons
 
     lootContent:SetHeight(yOffset > 0 and yOffset or 1)
+
+    -- UIPanelScrollFrameTemplate's scrollbar range doesn't reliably
+    -- shrink back down on its own when the scroll child gets smaller -
+    -- switching from All Time (long) to This Session (usually much
+    -- shorter) left the old, bigger range in place, so the thumb sat
+    -- partway down a track that was mostly blank past the real content.
+    -- Recompute and set the range explicitly every refresh instead of
+    -- relying on that automatic behavior, and clamp the current scroll
+    -- position down too in case it was already scrolled past the new,
+    -- smaller max.
+    if lootScrollFrame then
+        local maxScroll = yOffset - lootScrollFrame:GetHeight()
+        if maxScroll < 0 then maxScroll = 0 end
+        local scrollBar = _G["LootLedgerLootScrollFrameScrollBar"]
+        if scrollBar then
+            scrollBar:SetMinMaxValues(0, maxScroll)
+            if lootScrollFrame:GetVerticalScroll() > maxScroll then
+                lootScrollFrame:SetVerticalScroll(maxScroll)
+                scrollBar:SetValue(maxScroll)
+            end
+        end
+    end
 end
 
 local function ToggleLootWindow()
